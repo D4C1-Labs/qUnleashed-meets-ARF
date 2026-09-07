@@ -25,15 +25,14 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: 3.47.1
-          channel: stable
-          cache: true
+      # Pure bash, and needs neither Flutter nor the Firebase stub. It runs first
+      # so a broken setup cannot mask a regression in the release version maths,
+      # which auto-release.yml can only exercise on a real tag push.
+      - name: Test the release version derivation
+        run: .github/scripts/derive_version_test.sh
 
-      - name: Install Flutter dependencies
-        run: flutter pub get
+      - name: Set up Flutter
+        uses: ./.github/actions/setup-flutter
 
       # firebase_options.dart is generated, gitignored and restored from a
       # secret only for releases. CI never restores the real config, so the
