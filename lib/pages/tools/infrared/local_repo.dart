@@ -6,6 +6,7 @@ import 'dart:isolate';
 import 'package:archive/archive_io.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../../../components/path.dart';
 import '../../../services/http/app_http.dart';
 import '../../../services/storage/paths.dart';
 
@@ -218,13 +219,12 @@ class IrLibLocalRepo {
       send.send(_UnpackProgress(extracted, totalFiles, false));
 
       for (final entry in archive.files) {
-        var name = entry.name.replaceAll('\\', '/');
-        final slash = name.indexOf('/');
-        if (slash < 0) continue;
-        name = name.substring(slash + 1);
-        if (name.isEmpty) continue;
-        final outPath =
-            '${args.rootPath}${args.sep}${name.replaceAll('/', args.sep)}';
+        final outPath = resolveWrappedArchivePath(
+          args.rootPath,
+          entry.name,
+          separator: args.sep,
+        );
+        if (outPath == null) continue;
         if (entry.isFile) {
           final file = io.File(outPath);
           file.parent.createSync(recursive: true);

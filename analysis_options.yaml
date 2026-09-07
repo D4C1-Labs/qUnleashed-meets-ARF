@@ -3,4 +3,10 @@ include: package:flutter_lints/flutter.yaml
 analyzer:
   exclude:
     - build/**
-    - lib/modules/flipperlib/lib/generated/**
+    - lib/modules/flipperlib/lib/src/proto/generated/**
+    - android/**
+    - ios/**
+    - web/**
+    - windows/**
+    - macos/**
+    - linux/**
