@@ -46,6 +46,14 @@ jobs:
       - name: Set up Flutter
         uses: ./.github/actions/setup-flutter
 
+      - name: Verify Flutter and Dart
+        shell: bash
+        run: |
+          command -v flutter
+          command -v dart
+          flutter --version
+          dart --version
+
       # firebase_options.dart is generated, gitignored and restored from a
       # secret only for releases. CI never restores the real config, so the
       # placeholder is always written, fork or not.
