@@ -30,8 +30,7 @@ int qunleashed_hitag2hell_recover(
     uint32_t l0_end,
     uint8_t* out_key,
     int32_t* found,
-    void (*progress)(uint8_t pct, uint64_t slots_done, void* ctx),
-    void* ctx,
+    uint64_t* progress_out,
     volatile int32_t* cancel);
 
 // Compute the correct L0 slot ourselves from state31, using the same layer-0
@@ -109,14 +108,16 @@ int main(void) {
         uint8_t out_key[6] = {0};
         int32_t found = 0;
         volatile int32_t cancel = 0;
+        uint64_t progress_out = 0;
 
         int rc = qunleashed_hitag2hell_recover(
             uids, btns, cnts, hops, 1,
             l0, l0 + 100,
-            out_key, &found, progress_cb, NULL, &cancel);
+            out_key, &found, &progress_out, &cancel);
+        g_progress_calls = (progress_out != 0) ? 1 : 0;
 
-        printf("  recover rc=%d found=%d progress_calls=%d\n", rc, found,
-               g_progress_calls);
+        printf("  recover rc=%d found=%d progress=%016llx\n", rc, found,
+               (unsigned long long)progress_out);
         if(found) {
             printf("  key: %02X %02X %02X %02X %02X %02X\n", out_key[0],
                    out_key[1], out_key[2], out_key[3], out_key[4], out_key[5]);

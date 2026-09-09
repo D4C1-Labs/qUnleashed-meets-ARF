@@ -24,26 +24,38 @@
 #endif
 
 // ---------------------------------------------------------------------------
+// Progress reporting model (IMPORTANT)
+// ---------------------------------------------------------------------------
+// We do NOT call back into Dart from the native worker threads. Dart FFI
+// callbacks created with Pointer.fromFunction may only be invoked from the
+// thread of the isolate that created them; calling them from our pthread
+// workers crashes the app. Instead the bridge writes progress into a shared
+// `uint64_t* progress_out` cell (packed as (pct << 56) | slots) that the Dart
+// side polls with a Timer. Cancellation stays as a shared `volatile int32_t*`
+// flag the workers read. This keeps all Dart<->native crossings on plain
+// memory, safe from any thread.
+
+// ---------------------------------------------------------------------------
 // PSA bruteforce
 // ---------------------------------------------------------------------------
-// Adapter: the Dart callback signature is (pct, keys_tested, ctx) with no bool
-// return; cancellation is via the shared *cancel flag instead. The internal
-// PsaProgressFn must return bool, so we bridge through a small context.
 typedef struct {
-    void (*progress)(uint32_t pct, uint64_t keys_tested, void* ctx);
-    void* ctx;
-    volatile int32_t* cancel;
+    volatile uint64_t* progress_out; // packed (pct<<56)|keys, may be NULL
+    volatile int32_t* cancel;        // set by Dart to request abort, may be NULL
 } PsaBridgeCtx;
 
 static bool psa_bridge_progress(uint8_t pct, uint64_t keys_tested, void* raw) {
     PsaBridgeCtx* b = (PsaBridgeCtx*)raw;
-    if(b->progress) b->progress((uint32_t)pct, keys_tested, b->ctx);
+    if(b->progress_out) {
+        *b->progress_out =
+            (((uint64_t)pct & 0xFFULL) << 56) | (keys_tested & 0x00FFFFFFFFFFFFFFULL);
+    }
     if(b->cancel && *b->cancel) return false;
     return true;
 }
 
 // Run the PSA TEA bruteforce. Returns 0 on success (fields written to the out
 // params, *found=1), -2 on bad args, -10 when no key was found (*found=0).
+// progress_out: optional shared cell the bridge writes packed progress into.
 QUNLEASHED_EXPORT int qunleashed_psa_bruteforce(
     const uint8_t* key1,
     const uint8_t* key2,
@@ -52,18 +64,17 @@ QUNLEASHED_EXPORT int qunleashed_psa_bruteforce(
     uint8_t* out_btn,
     uint8_t* out_type,
     int32_t* found,
-    void (*progress)(uint32_t pct, uint64_t keys_tested, void* ctx),
-    void* ctx,
+    uint64_t* progress_out,
     volatile int32_t* cancel) {
     if(found) *found = 0;
     if(!key1 || !key2) return -2;
 
-    PsaBridgeCtx bctx = {progress, ctx, cancel};
+    PsaBridgeCtx bctx = {progress_out, cancel};
     PsaResult res;
     memset(&res, 0, sizeof(res));
 
     bool ok = psa_bruteforce_run(
-        key1, key2, &res, progress ? psa_bridge_progress : NULL, &bctx, cancel);
+        key1, key2, &res, psa_bridge_progress, &bctx, cancel);
 
     if(!ok) {
         if(found) *found = 0;
@@ -91,17 +102,19 @@ QUNLEASHED_EXPORT uint32_t qunleashed_keeloq_encrypt(uint32_t data, uint64_t key
 // ---------------------------------------------------------------------------
 // Hitag2Hell (heavy, multithread)
 // ---------------------------------------------------------------------------
-// The Dart progress callback is void-returning; cancellation goes through the
-// shared *cancel flag. Bridge it to the bool-returning Hitag2ProgressFn.
+// Same shared-memory progress model as PSA: write packed (pct<<56)|slots into
+// progress_out; never call back into Dart from worker threads.
 typedef struct {
-    void (*progress)(uint8_t pct, uint64_t slots_done, void* ctx);
-    void* ctx;
-    volatile int32_t* cancel;
+    volatile uint64_t* progress_out; // packed (pct<<56)|slots, may be NULL
+    volatile int32_t* cancel;        // set by Dart to request abort, may be NULL
 } Hitag2BridgeCtx;
 
 static bool hitag2_bridge_progress(uint8_t pct, uint64_t slots_done, void* raw) {
     Hitag2BridgeCtx* b = (Hitag2BridgeCtx*)raw;
-    if(b->progress) b->progress(pct, slots_done, b->ctx);
+    if(b->progress_out) {
+        *b->progress_out =
+            (((uint64_t)pct & 0xFFULL) << 56) | (slots_done & 0x00FFFFFFFFFFFFFFULL);
+    }
     if(b->cancel && *b->cancel) return false;
     return true;
 }
@@ -109,7 +122,7 @@ static bool hitag2_bridge_progress(uint8_t pct, uint64_t slots_done, void* raw) 
 // Recover a Fiat V1 48-bit key from one or more captures. The parallel arrays
 // uids/btns/cnts/hops each hold `capture_count` entries. Returns 0 on success
 // (out_key filled, *found=1), -2 on bad args, -10 when no cross-validated key
-// was found (*found=0).
+// was found (*found=0). progress_out: optional shared packed-progress cell.
 QUNLEASHED_EXPORT int qunleashed_hitag2hell_recover(
     const uint32_t* uids,
     const uint8_t* btns,
@@ -120,8 +133,7 @@ QUNLEASHED_EXPORT int qunleashed_hitag2hell_recover(
     uint32_t l0_end,
     uint8_t* out_key,
     int32_t* found,
-    void (*progress)(uint8_t pct, uint64_t slots_done, void* ctx),
-    void* ctx,
+    uint64_t* progress_out,
     volatile int32_t* cancel) {
     if(found) *found = 0;
     if(!uids || !btns || !cnts || !hops || !out_key || capture_count == 0) {
@@ -138,7 +150,7 @@ QUNLEASHED_EXPORT int qunleashed_hitag2hell_recover(
         caps[i].hop = hops[i];
     }
 
-    Hitag2BridgeCtx bctx = {progress, ctx, cancel};
+    Hitag2BridgeCtx bctx = {progress_out, cancel};
     uint8_t key[6];
     bool ok = hitag2_threaded_recover(
         caps,
@@ -146,7 +158,7 @@ QUNLEASHED_EXPORT int qunleashed_hitag2hell_recover(
         l0_start,
         l0_end,
         key,
-        progress ? hitag2_bridge_progress : NULL,
+        hitag2_bridge_progress,
         &bctx,
         cancel);
 

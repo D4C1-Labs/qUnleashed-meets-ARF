@@ -34,16 +34,9 @@ class Hitag2Capture {
 /// Outcome of a Hitag2Hell recovery: the 6-byte key when [found], else a
 /// not-found / cancelled marker.
 class Hitag2Result {
-  const Hitag2Result._({
-    required this.key,
-    required this.cancelled,
-  });
-
   const Hitag2Result.recovered(Uint8List this.key) : cancelled = false;
 
-  const Hitag2Result.notFound({bool cancelled = false})
-    : key = null,
-      this.cancelled = cancelled;
+  const Hitag2Result.notFound({this.cancelled = false}) : key = null;
 
   /// The recovered 48-bit key as 6 bytes, or null when nothing was found.
   final Uint8List? key;
@@ -87,8 +80,13 @@ class Hitag2RecoverHandle {
 //       uint32_t capture_count,
 //       uint32_t l0_start, uint32_t l0_end,
 //       uint8_t* out_key, int32_t* found,
-//       void (*progress)(uint8_t pct, uint64_t slots_done, void* ctx),
-//       void* ctx, volatile int32_t* cancel);
+//       uint64_t* progress_out, volatile int32_t* cancel);
+//
+// Progress is a SHARED MEMORY cell (Pointer<Uint64>) the native code writes,
+// NOT a Dart callback. Dart FFI callbacks may only be called from the isolate
+// thread; the native worker pthreads cannot legally invoke one, which crashed
+// the app. The bridge instead packs (pct<<56)|slots into *progress_out and the
+// Dart side polls it with a Timer.
 typedef _Hitag2Native =
     Int32 Function(
       Pointer<Uint32> uids,
@@ -100,8 +98,7 @@ typedef _Hitag2Native =
       Uint32 l0End,
       Pointer<Uint8> outKey,
       Pointer<Int32> found,
-      Pointer<NativeFunction<_Hitag2ProgressNative>> progress,
-      Pointer<Void> ctx,
+      Pointer<Uint64> progressOut,
       Pointer<Int32> cancel,
     );
 
@@ -116,24 +113,19 @@ typedef _Hitag2Dart =
       int l0End,
       Pointer<Uint8> outKey,
       Pointer<Int32> found,
-      Pointer<NativeFunction<_Hitag2ProgressNative>> progress,
-      Pointer<Void> ctx,
+      Pointer<Uint64> progressOut,
       Pointer<Int32> cancel,
     );
 
-// Note: pct here is uint8_t (differs from PSA's uint32_t).
-typedef _Hitag2ProgressNative =
-    Void Function(Uint8 pct, Uint64 slotsDone, Pointer<Void> ctx);
-
 /// Runs the Hitag2Hell Fiat V1 attack on a worker isolate.
 ///
-/// Progress/cancel use the same **shared native scratch + polling** approach as
-/// [NativePsaRecoverer] — a `Pointer<Int32>` cancel flag and a `Pointer<Uint64>`
-/// packed `(pct << 56) | slots` progress counter, both allocated on the parent
-/// and addressed from the worker — because the native engine calls the progress
-/// callback from its own worker *threads*, which cannot legally invoke a
-/// `NativeCallable.listener` bound to the UI isolate. See that class for the
-/// full rationale.
+/// Progress/cancel use a **shared native memory + polling** approach: a
+/// `Pointer<Int32>` cancel flag and a `Pointer<Uint64>` packed
+/// `(pct << 56) | slots` progress cell, both allocated on the parent and
+/// addressed from the worker. The native engine writes progress directly into
+/// that cell from its worker threads (a plain memory store, thread-safe), and
+/// this side polls it with a Timer. No Dart callback is ever invoked from a
+/// native thread, which would crash.
 class NativeHitag2HellRecoverer {
   /// Starts a recovery over [captures]. The L0 sweep defaults to the full
   /// 2^20 space (`l0Start == l0End == 0`); pass a narrower `[l0Start, l0End)`
@@ -191,7 +183,14 @@ class NativeHitag2HellRecoverer {
       progressAddress: progressCounter.address,
     );
 
-    final result = Isolate.run(() => _runInIsolate(payload)).whenComplete(() {
+    // IMPORTANT: pass the static entry point directly as the isolate closure
+    // (`Isolate.run(() => _runInIsolate(payload))` would capture `timer` and
+    // `progressController` from this lexical scope, which are non-sendable and
+    // trigger "object is unsendable - _Timer" at runtime). Building the future
+    // first, before referencing `timer` in `whenComplete`, keeps the sent
+    // closure free of any non-sendable capture.
+    final Future<Hitag2Result> runFuture = _spawnRecovery(payload);
+    final result = runFuture.whenComplete(() {
       timer.cancel();
       calloc.free(cancel);
       calloc.free(progressCounter);
@@ -203,6 +202,13 @@ class NativeHitag2HellRecoverer {
     });
   }
 
+  /// Spawns the worker isolate. Kept as a separate static method so the
+  /// closure sent to [Isolate.run] captures ONLY [payload] (which is sendable)
+  /// and nothing from the caller's scope (timer / stream controller).
+  static Future<Hitag2Result> _spawnRecovery(_Hitag2Payload payload) {
+    return Isolate.run(() => _runInIsolate(payload));
+  }
+
   static Hitag2Result _runInIsolate(_Hitag2Payload p) {
     final library = openSubghzNativeLibrary();
     final run = library.lookupFunction<_Hitag2Native, _Hitag2Dart>(
@@ -210,7 +216,7 @@ class NativeHitag2HellRecoverer {
     );
 
     final cancel = Pointer<Int32>.fromAddress(p.cancelAddress);
-    _progressSlot = Pointer<Uint64>.fromAddress(p.progressAddress);
+    final progressOut = Pointer<Uint64>.fromAddress(p.progressAddress);
 
     final n = p.uids.length;
     final uids = calloc<Uint32>(n);
@@ -225,9 +231,6 @@ class NativeHitag2HellRecoverer {
       cnts.asTypedList(n).setAll(0, p.cnts);
       hops.asTypedList(n).setAll(0, p.hops);
 
-      final progressPtr =
-          Pointer.fromFunction<_Hitag2ProgressNative>(_onProgress);
-
       final rc = run(
         uids,
         btns,
@@ -238,8 +241,7 @@ class NativeHitag2HellRecoverer {
         p.l0End,
         outKey,
         found,
-        progressPtr,
-        nullptr,
+        progressOut, // native writes packed (pct<<56)|slots here
         cancel,
       );
 
@@ -258,14 +260,6 @@ class NativeHitag2HellRecoverer {
       calloc.free(outKey);
       calloc.free(found);
     }
-  }
-
-  static Pointer<Uint64>? _progressSlot;
-
-  static void _onProgress(int pct, int slotsDone, Pointer<Void> ctx) {
-    final slot = _progressSlot;
-    if (slot == null) return;
-    slot.value = ((pct & 0xFF) << 56) | (slotsDone & 0x00FFFFFFFFFFFFFF);
   }
 }
 

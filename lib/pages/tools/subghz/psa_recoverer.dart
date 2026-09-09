@@ -103,9 +103,12 @@ class PsaBruteforceHandle {
 //       uint64_t* out_serial, uint32_t* out_cnt,
 //       uint8_t* out_btn, uint8_t* out_type,
 //       int32_t* found,
-//       void (*progress)(uint32_t pct, uint64_t keys_tested, void* ctx),
-//       void* ctx,
+//       uint64_t* progress_out,
 //       volatile int32_t* cancel);
+//
+// Progress is a SHARED MEMORY cell the native code writes (see the Hitag2
+// recoverer for the full rationale) — NOT a Dart callback, which cannot be
+// invoked from the native worker threads without crashing.
 typedef _PsaNative =
     Int32 Function(
       Pointer<Uint8> key1,
@@ -115,8 +118,7 @@ typedef _PsaNative =
       Pointer<Uint8> outBtn,
       Pointer<Uint8> outType,
       Pointer<Int32> found,
-      Pointer<NativeFunction<_PsaProgressNative>> progress,
-      Pointer<Void> ctx,
+      Pointer<Uint64> progressOut,
       Pointer<Int32> cancel,
     );
 
@@ -129,18 +131,9 @@ typedef _PsaDart =
       Pointer<Uint8> outBtn,
       Pointer<Uint8> outType,
       Pointer<Int32> found,
-      Pointer<NativeFunction<_PsaProgressNative>> progress,
-      Pointer<Void> ctx,
+      Pointer<Uint64> progressOut,
       Pointer<Int32> cancel,
     );
-
-// The native progress callback: void(uint32_t pct, uint64_t keys_tested,
-// void* ctx). We run it *inside the worker isolate* (a leaf callback with no
-// Dart heap access beyond writing native scratch), so it can be a plain
-// Pointer.fromFunction rather than a NativeCallable.listener bound to another
-// isolate — see the class doc for why.
-typedef _PsaProgressNative =
-    Void Function(Uint32 pct, Uint64 keysTested, Pointer<Void> ctx);
 
 /// Runs the PSA TEA bruteforce on a worker isolate.
 ///
@@ -149,28 +142,25 @@ typedef _PsaProgressNative =
 /// `Isolate.run` moves the whole attack off the UI isolate. Two facts shape how
 /// progress and cancellation cross back:
 ///
-/// * A `NativeCallable.listener` is bound to the isolate that created it, and
-///   its `nativeFunction` may only be invoked from that isolate. The native
-///   engine calls the progress callback from its own worker *threads* (spawned
-///   by the C side, not Dart isolates), so a listener created on the UI isolate
-///   cannot legally be invoked by them.
+/// * A Dart FFI callback (`Pointer.fromFunction` / `NativeCallable`) may only
+///   be invoked from the thread of the isolate that created it. The native
+///   engine reports progress from its own worker *threads* (spawned by the C
+///   side, not Dart isolates), so it must NEVER call back into Dart — doing so
+///   crashes the app.
 /// * Native heap is process-global: a pointer allocated on one isolate stays
 ///   valid on another. Only its integer address needs to travel.
 ///
-/// So we use **shared native scratch + polling**, which is both simpler and
-/// safe here:
+/// So we use **shared native memory + polling**, which is both simpler and
+/// safe from any thread:
 ///
 /// * `cancel`  — a `Pointer<Int32>` allocated on the *parent*. Its address is
 ///   handed to the worker, which casts it back and passes it straight to C.
 ///   [PsaBruteforceHandle.cancel] writes 1; the C loop reads it at each
 ///   checkpoint (see `psa_bridge_progress`).
-/// * `progress` — a `Pointer<Uint64>` counter packed as `(pct << 56) | keys`,
-///   written by an in-worker `Pointer.fromFunction` callback. The parent polls
-///   it every 250 ms with a `Timer` and republishes on the [Stream]. This
-///   avoids any cross-isolate callback invocation entirely.
-///
-/// The callback runs on the worker's threads but only writes to native memory
-/// (no Dart allocation), which is safe for a `Pointer.fromFunction` leaf.
+/// * `progress` — a `Pointer<Uint64>` cell packed as `(pct << 56) | keys`. The
+///   C bridge writes it directly (a plain aligned store, safe from any worker
+///   thread); the parent polls it every 250 ms with a `Timer` and republishes
+///   on the [Stream]. No Dart code is ever invoked from a native thread.
 class NativePsaRecoverer {
   /// Starts a bruteforce for the 8-byte [key1] / [key2] TEA halves and returns
   /// a handle to watch and cancel it.
@@ -214,7 +204,11 @@ class NativePsaRecoverer {
       progressAddress: progressCounter.address,
     );
 
-    final result = Isolate.run(() => _runInIsolate(payload)).whenComplete(() {
+    // See NativeHitag2HellRecoverer: build the future via a static method so
+    // the closure sent to the isolate captures only `payload` and not the
+    // non-sendable `timer` / `progressController` from this scope.
+    final Future<PsaResult> runFuture = _spawnBruteforce(payload);
+    final result = runFuture.whenComplete(() {
       timer.cancel();
       calloc.free(cancel);
       calloc.free(progressCounter);
@@ -227,6 +221,12 @@ class NativePsaRecoverer {
     });
   }
 
+  /// Spawns the worker isolate; keeps the sent closure free of non-sendable
+  /// captures (see NativeHitag2HellRecoverer._spawnRecovery).
+  static Future<PsaResult> _spawnBruteforce(_PsaPayload payload) {
+    return Isolate.run(() => _runInIsolate(payload));
+  }
+
   static PsaResult _runInIsolate(_PsaPayload p) {
     final library = openSubghzNativeLibrary();
     final run = library.lookupFunction<_PsaNative, _PsaDart>(
@@ -235,7 +235,7 @@ class NativePsaRecoverer {
 
     // Re-materialise the parent's scratch from the transferred addresses.
     final cancel = Pointer<Int32>.fromAddress(p.cancelAddress);
-    _progressSlot = Pointer<Uint64>.fromAddress(p.progressAddress);
+    final progressOut = Pointer<Uint64>.fromAddress(p.progressAddress);
 
     final key1 = calloc<Uint8>(8);
     final key2 = calloc<Uint8>(8);
@@ -248,9 +248,6 @@ class NativePsaRecoverer {
       key1.asTypedList(8).setAll(0, p.key1);
       key2.asTypedList(8).setAll(0, p.key2);
 
-      final progressPtr =
-          Pointer.fromFunction<_PsaProgressNative>(_onProgress);
-
       final rc = run(
         key1,
         key2,
@@ -259,8 +256,7 @@ class NativePsaRecoverer {
         outBtn,
         outType,
         found,
-        progressPtr,
-        nullptr,
+        progressOut, // native writes packed (pct<<56)|keys here
         cancel,
       );
 
@@ -283,20 +279,6 @@ class NativePsaRecoverer {
       calloc.free(outType);
       calloc.free(found);
     }
-  }
-
-  // Worker-local slot the leaf callback writes into. A top-level static because
-  // Pointer.fromFunction can only wrap a static/top-level function (no closure
-  // capture). One bruteforce runs per isolate, so there is no aliasing.
-  static Pointer<Uint64>? _progressSlot;
-
-  static void _onProgress(int pct, int keysTested, Pointer<Void> ctx) {
-    final slot = _progressSlot;
-    if (slot == null) return;
-    // Pack pct (0..100) in the top byte, keys in the low 56 bits. A single
-    // aligned 64-bit store the parent reads without tearing on real targets.
-    slot.value =
-        ((pct & 0xFF) << 56) | (keysTested & 0x00FFFFFFFFFFFFFF);
   }
 }
 
