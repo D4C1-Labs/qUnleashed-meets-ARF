@@ -27,6 +27,19 @@ class QAppConfig {
           tertiary: Color(0xFFFFD580),
         ),
       ),
+      // [ARF] Flipper-ARF firmware (D4C1-Labs fork). Matched against the
+      // device-reported origin.fork / version string via matchKeywords.
+      FirmwareEntry(
+        name: 'ARF',
+        shortName: 'arf',
+        icon: 'arf.png',
+        matchKeywords: ['arf', 'flipper-arf', 'd4c1-labs', 'd4c1'],
+        colors: FirmwareColors(
+          primary: Color(0xFF2E9E7B),
+          secondary: Color(0xFF1F6E56),
+          tertiary: Color(0xFF7FD1B5),
+        ),
+      ),
     ],
   );
 

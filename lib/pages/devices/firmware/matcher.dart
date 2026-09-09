@@ -79,6 +79,9 @@ class FirmwareMatcher {
     if (_looksLikeUnleashed(raw, originFork)) {
       return _parseInstalledUnleashed(raw, branchName);
     }
+    if (_looksLikeArf(raw, originFork)) {
+      return _parseInstalledArf(raw, branchName); // [ARF]
+    }
     return _parseInstalledOfw(raw, branchName);
   }
 
@@ -98,6 +101,35 @@ class FirmwareMatcher {
     return normalizedVersion.contains('unlshd') ||
         normalizedVersion.contains('unleashed') ||
         normalizedOrigin.contains('unleashed');
+  }
+
+  // [ARF] Detect the Flipper-ARF fork from the device version/origin fields.
+  bool _looksLikeArf(String rawVersion, String? originFork) {
+    final normalizedVersion = rawVersion.toLowerCase();
+    final normalizedOrigin = originFork?.toLowerCase() ?? '';
+    return normalizedVersion.contains('arf') ||
+        normalizedOrigin.contains('arf') ||
+        normalizedOrigin.contains('flipper-arf') ||
+        normalizedOrigin.contains('d4c1');
+  }
+
+  // [ARF] Parse an installed ARF firmware. ARF has no compact/extra variants,
+  // so `variant` is always null. The channel is derived from the branch name
+  // (dev builds are tagged dev-<hash>; releases use semantic versions).
+  _InstalledFirmware _parseInstalledArf(String rawVersion, String? branchName) {
+    final normalized = rawVersion.trim();
+    final lower = normalized.toLowerCase();
+    // Dev builds report a version like "dev-2b1f9c"; treat anything with "dev"
+    // as the development channel, otherwise fall back to release.
+    final channel = (lower.contains('dev') || (branchName?.toLowerCase().contains('dev') ?? false))
+        ? FirmwareChannel.development
+        : FirmwareChannel.release;
+    return _InstalledFirmware(
+      type: 'arf',
+      channel: channel,
+      version: normalized,
+      variant: null,
+    );
   }
 
   _InstalledFirmware _parseInstalledUnleashed(

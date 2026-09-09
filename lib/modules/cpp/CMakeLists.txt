@@ -5,5 +5,7 @@ project(qunleashed_native LANGUAGES C)
 # self-contained shared library the app loads via dart:ffi:
 #   qunleashed_mfkey32    - mfkey32 + weak/static/static-encrypted nested recovery
 #   qunleashed_hardnested - host-side hardnested attack (embedded bitflip tables)
+#   qunleashed_subghz     - PSA TEA bruteforce, KeeLoq, Hitag2Hell (Fiat V1)
 add_subdirectory(mfkey32)
 add_subdirectory(hardnested)
+add_subdirectory(subghz)

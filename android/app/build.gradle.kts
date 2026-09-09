@@ -4,7 +4,10 @@ import java.util.Properties
 plugins {
     id("com.android.application")
     // START: FlutterFire Configuration
-    id("com.google.gms.google-services")
+    // [ARF-BUILD] Disabled for local test builds — the google-services plugin
+    // requires a google-services.json (Firebase config) that is not committed.
+    // Re-enable after running `flutterfire configure` for real push support.
+    // id("com.google.gms.google-services")
     // END: FlutterFire Configuration
     id("dev.flutter.flutter-gradle-plugin")
 }

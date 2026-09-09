@@ -62,8 +62,10 @@ class QAppThemeController extends ChangeNotifier with WidgetsBindingObserver {
 
   bool get isDark => brightness == Brightness.dark;
 
-  static bool _firmwareIsDark(FirmwareEntry firmware) =>
-      firmware.shortName.toLowerCase() == 'unlshd';
+  static bool _firmwareIsDark(FirmwareEntry firmware) {
+    final s = firmware.shortName.toLowerCase();
+    return s == 'unlshd' || s == 'arf'; // [ARF] ARF uses the dark theme too
+  }
 
   Future<void> loadThemeMode() async {
     final prefs = await SharedPreferences.getInstance();

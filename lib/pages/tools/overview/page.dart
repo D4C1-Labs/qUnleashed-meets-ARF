@@ -16,6 +16,7 @@ import '../remote/cli/page.dart';
 import '../infrared/categories_page.dart';
 import '../mifare/recover_page.dart';
 import '../plotter/page.dart';
+import '../subghz/subghz_tools_page.dart'; // [ARF]
 import 'models/tool.dart';
 import 'widgets/app_version.dart';
 import 'widgets/tool_item_badge.dart';
@@ -91,6 +92,17 @@ class ToolsPage extends StatelessWidget {
           title: s.toolMifare,
           description: s.toolMifareSubtitle,
           routeBuilder: _buildRecoverPage,
+          badge: s.toolBadgeBeta,
+        ),
+        // [ARF] Sub-GHz crypto tools: PSA Decrypt, KeeLoq Decrypt, Hitag2Hell.
+        // These run natively on the phone's CPU (multi-core + NEON), much
+        // faster than the Flipper's Cortex-M4.
+        ToolItemModel(
+          iconAsset: 'assets/ic/fileformat/sub.svg',
+          iconColor: const Color(0xFF2E9E7B),
+          title: 'Sub-GHz Crypto',
+          description: 'PSA / KeeLoq decrypt & Hitag2Hell (Fiat V1)',
+          routeBuilder: _buildSubghzToolsPage,
           badge: s.toolBadgeBeta,
         ),
         ToolItemModel(
@@ -241,6 +253,9 @@ class ToolsPage extends StatelessWidget {
 }
 
 Widget _buildRecoverPage(BuildContext context) => const RecoverPage();
+
+// [ARF] Sub-GHz crypto tools page (PSA / KeeLoq / Hitag2Hell).
+Widget _buildSubghzToolsPage(BuildContext context) => const SubghzToolsPage();
 
 Widget _buildPlotterPage(BuildContext context) => const PulsePlotterPage();
 

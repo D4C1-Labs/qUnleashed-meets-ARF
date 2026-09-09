@@ -31,6 +31,9 @@ target 'Runner' do
   use_frameworks!
   # Host-side hardnested attack FFI lib (see lib/modules/cpp/hardnested).
   pod 'qunleashed_hardnested', :path => '../lib/modules/cpp/hardnested/apple'
+  # Host-side Sub-GHz crypto FFI lib: PSA, KeeLoq, Hitag2Hell (see
+  # lib/modules/cpp/subghz).
+  pod 'qunleashed_subghz', :path => '../lib/modules/cpp/subghz/apple'
 
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
   target 'RunnerTests' do
