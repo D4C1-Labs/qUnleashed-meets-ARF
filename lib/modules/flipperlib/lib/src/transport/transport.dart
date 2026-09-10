@@ -14,6 +14,17 @@ class FlipperTransportError implements Exception {
   String toString() => message;
 }
 
+// A connect failed because the OS bond and the Flipper's bond no longer match
+// (stale/mismatched pairing keys): the link comes up and is dropped immediately
+// on encryption. This is NOT auto-retryable against the same bond — retrying
+// just loops connect/disconnect. The transport clears the phone-side bond
+// before throwing this, so the next connect attempt re-pairs cleanly (the user
+// re-enters the PIN once). Callers must surface a "re-pair required" prompt and
+// must not auto-reconnect on this error.
+class FlipperBondMismatchError extends FlipperTransportError {
+  FlipperBondMismatchError(super.message);
+}
+
 // Logical transport lifecycle (the byte pipe), distinct from the BLE platform
 // link state `BleLinkState` one layer down: `active` means writes/reads are
 // allowed, regardless of how the underlying link is being established or torn

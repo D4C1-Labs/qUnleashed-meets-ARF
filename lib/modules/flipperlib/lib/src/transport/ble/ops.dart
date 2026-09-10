@@ -22,6 +22,13 @@ abstract class BleOps {
   // to CONNECTION_PRIORITY_HIGH, ~7.5-15 ms). Best-effort: unsupported
   // platforms/plugins throw and the caller ignores it.
   Future<void> requestHighPriority(String deviceId);
+  // Whether the OS currently holds a bond for this device. Best-effort:
+  // platforms that cannot answer return false.
+  Future<bool> isPaired(String deviceId);
+  // Clears the OS-level bond for this device (Android removeBond). Used to
+  // recover from a stale/mismatched bond so the next connect re-pairs cleanly.
+  // Best-effort: unsupported platforms/plugins throw and the caller ignores it.
+  Future<void> unpair(String deviceId);
   Future<List<BleService>> discoverServices(String deviceId);
   Future<void> subscribeNotifications(
     String deviceId,
@@ -78,6 +85,19 @@ class UniversalBleOps implements BleOps {
         deviceId,
         uble.BleConnectionPriority.highPerformance,
       );
+
+  @override
+  Future<bool> isPaired(String deviceId) async {
+    try {
+      final paired = await uble.UniversalBle.isPaired(deviceId);
+      return paired ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<void> unpair(String deviceId) => uble.UniversalBle.unpair(deviceId);
 
   @override
   Future<List<BleService>> discoverServices(String deviceId) async {

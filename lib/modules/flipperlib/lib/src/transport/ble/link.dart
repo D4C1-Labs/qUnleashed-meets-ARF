@@ -42,6 +42,13 @@ abstract class UniversalBleTransportBase extends Transport {
   static const Duration _stallPoll = Duration(seconds: 5);
   static const int _stallPollLimit = 6;
 
+  // Stale-bond recovery: how many clean reconnect+retry attempts to make before
+  // concluding the bond itself is mismatched. Level 1 (below this) recovers a
+  // phone-side GATT/bond glitch with no PIN prompt; at this count we clear the
+  // bond and ask for a one-time re-pair. First-time pairing (device not yet
+  // bonded) is exempt and keeps looping so the user can finish the PIN.
+  static const int _bondRecoverReconnectLimit = 4;
+
   // Exactly one transport may own a platform connect attempt at a time. A
   // stale attempt's timeout or close must never disconnect a newer connection.
   static int _connectAttemptGen = 0;
@@ -356,6 +363,16 @@ abstract class UniversalBleTransportBase extends Transport {
   @override
   FlipperMode get initialMode => FlipperMode.rpc;
 
+  // Storage (firmware-install) file transfers chunk at the firmware's full
+  // 1024-byte RPC buffer instead of the generic 512-byte default. One RPC
+  // write frame then exactly fills one flow-control credit window, halving the
+  // number of RPC frames / protobuf-framing overhead / worker cycles per KB.
+  // The transport still fragments each frame into <=411-byte ATT writes and
+  // coalesces across frame boundaries, so there is no short-write penalty and
+  // no change to the write-with-response reliability. USB already uses 1024.
+  @override
+  int get storageChunkSize => _rpcBufferSize;
+
   @override
   Future<void> open() async {
     _connectionOwner = this;
@@ -372,6 +389,19 @@ abstract class UniversalBleTransportBase extends Transport {
     // over an encrypted link. Loop until setup completes or the user cancels
     // (Cancel -> abortPendingConnect -> _pairingAbort).
     final pairingAbort = _pairingAbort = Completer<void>();
+    // Tiered stale-bond recovery. A link that comes up and drops right back
+    // during the encrypted setup is either (a) a first-time pairing where the
+    // controller gives up before the PIN is entered, (b) a phone-side GATT
+    // cache / bond glitch that a clean reconnect fixes WITHOUT re-pairing, or
+    // (c) a genuinely mismatched bond that will loop forever against the same
+    // keys. We cannot tell (a)/(b) from (c) up front, so:
+    //   Level 1 (attempts < _bondRecoverReconnectLimit): just reconnect+retry.
+    //     This transparently recovers (a) and (b) with no PIN prompt.
+    //   Level 2 (limit reached, device is bonded): the bond is the problem.
+    //     Clear the phone-side bond once and throw a distinct, non-retryable
+    //     FlipperBondMismatchError so the UI prompts a clean re-pair instead of
+    //     looping. Only reached when a clean reconnect kept failing.
+    var didUnpairForBond = false;
     try {
       var attempt = 0;
       while (true) {
@@ -385,8 +415,34 @@ abstract class UniversalBleTransportBase extends Transport {
           }
           if (!_isPairingDrop(e)) rethrow;
           attempt++;
+
+          // Level 2: too many quick drops — treat as a stale bond. Clear the
+          // phone-side bond once (best effort), then stop looping with a
+          // distinct error so the next connect re-pairs cleanly.
+          if (attempt >= _bondRecoverReconnectLimit && !didUnpairForBond) {
+            final bonded = await _ops.isPaired(deviceId).catchError((_) => false);
+            if (bonded) {
+              didUnpairForBond = true;
+              Log.info(
+                '[BLE] $attempt quick drops during setup on a bonded device; '
+                'clearing the stale phone-side bond and requesting a re-pair',
+              );
+              try {
+                await _ops.unpair(deviceId);
+              } catch (e2) {
+                Log.error('[BLE] unpair (stale bond recovery) failed: $e2');
+              }
+              throw FlipperBondMismatchError(
+                'BLE bond mismatch: cleared the stale pairing on this phone. '
+                'Re-pair the Flipper (you may be asked for the PIN once).',
+              );
+            }
+            // Not bonded after all: this is genuine first-time pairing taking a
+            // while. Keep looping so the user can finish entering the PIN.
+          }
+
           Log.info(
-            '[BLE] link dropped during first-time pairing (attempt $attempt); '
+            '[BLE] link dropped during pairing/setup (attempt $attempt); '
             'reconnecting so the user can finish entering the PIN',
           );
           final reconnected = await _reconnectForPairing(

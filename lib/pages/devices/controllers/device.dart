@@ -54,6 +54,11 @@ class DeviceController extends ChangeNotifier {
   String? _connectingKnownId;
   bool _bleAutoScanDone = false;
   final Set<String> _autoConnectAttemptedIds = {};
+  // Devices whose bond is mismatched and need a manual re-pair. Unlike
+  // _autoConnectAttemptedIds this is NOT cleared when the device re-appears in
+  // a scan, so auto-connect stops hammering a device that loops on a stale
+  // bond. Cleared only by an explicit user connect (which re-pairs).
+  final Set<String> _needsRepairIds = {};
   Timer? _autoConnectTimer;
 
   StreamSubscription<FlipperConnectionState>? _connectionSub;
@@ -117,6 +122,9 @@ class DeviceController extends ChangeNotifier {
   /// Connects to [device]. Throws on failure.
   Future<void> connect(FlipperDevice device) async {
     if (_userDisconnectedId == device.id) _userDisconnectedId = null;
+    // An explicit connect is the user's chance to re-pair after a bond
+    // mismatch: clear the flag so this attempt (and its PIN prompt) proceeds.
+    _needsRepairIds.remove(device.id);
     final connected = await _client.connect(device);
     _setupDevice(connected);
   }
@@ -272,10 +280,26 @@ class DeviceController extends ChangeNotifier {
     final candidate = _autoConnectCandidate(present, last);
     if (candidate == null) return;
 
+    // A device with a known bond mismatch must not be auto-reconnected: doing
+    // so recreates the connect/disconnect loop. Wait for an explicit user
+    // connect, which clears the flag and re-pairs.
+    if (_needsRepairIds.contains(candidate.id)) {
+      LogService.log(
+        '[DeviceController] skipping auto-connect to ${candidate.name}: '
+        'bond mismatch, needs manual re-pair',
+      );
+      return;
+    }
+
     _autoConnectAttemptedIds.add(candidate.id);
     LogService.log('[DeviceController] auto-connecting to ${candidate.name}');
     try {
       await connect(candidate);
+    } on FlipperBondMismatchError catch (e) {
+      _needsRepairIds.add(candidate.id);
+      LogService.log(
+        '[DeviceController] auto-connect bond mismatch on ${candidate.name}: $e',
+      );
     } catch (e) {
       LogService.log('[DeviceController] auto-connect failed: $e');
     }
@@ -428,6 +452,20 @@ class DeviceController extends ChangeNotifier {
       _notify();
       return;
     }
+    // A bond mismatch discovered during a reconnect surfaces here as the
+    // closeReason. Flag the device so auto-connect stops looping on it until
+    // the user explicitly reconnects (which re-pairs). The device is the one
+    // that just dropped (state.device is null on disconnect, so use _device).
+    if (state.closeReason is FlipperBondMismatchError) {
+      final id = _device?.id;
+      if (id != null) {
+        _needsRepairIds.add(id);
+        LogService.log(
+          '[DeviceController] bond mismatch on reconnect; needs re-pair: $id',
+        );
+      }
+    }
+
     _cancelDataStreams();
     _deviceDisconnected = true;
     _deviceLoading = false;

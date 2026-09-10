@@ -241,7 +241,12 @@ class FlipperSession {
     unawaited(
       _client.serialized(() async {
         if (gen != _sessionGen) return;
-        if (!_client.autoReconnect || !_mayAutoReconnect()) {
+        // A bond mismatch is not fixable by reconnecting to the same bond: the
+        // transport already cleared the phone-side bond and the user must
+        // re-pair. Never auto-reconnect on it, or we recreate the loop one
+        // layer up.
+        final bondMismatch = reason is FlipperBondMismatchError;
+        if (bondMismatch || !_client.autoReconnect || !_mayAutoReconnect()) {
           await teardownLocked(reason);
           _client.onSessionEnded(this);
           return;
@@ -312,7 +317,12 @@ class FlipperSession {
       await establishLocked(autoRpc: _autoRpc);
     } catch (error) {
       Log.error('[FlipperClient] reconnect failed: $error');
-      await teardownLocked(reason);
+      // A bond mismatch surfaced during reconnect must be the terminal reason
+      // (not the original link-loss reason) so the UI layer can see it via
+      // closeReason and stop auto-connecting this device until a manual
+      // re-pair. The transport already cleared the phone-side bond.
+      final endReason = error is FlipperBondMismatchError ? error : reason;
+      await teardownLocked(endReason);
       // The mode is already `disconnected`, so _setMode stayed silent; emit
       // the final (non-reconnecting) state explicitly so listeners leave the
       // "reconnecting" presentation.
@@ -322,7 +332,7 @@ class FlipperSession {
             mode: FlipperMode.disconnected,
             device: null,
             connected: false,
-            closeReason: reason,
+            closeReason: endReason,
           ),
         );
       }

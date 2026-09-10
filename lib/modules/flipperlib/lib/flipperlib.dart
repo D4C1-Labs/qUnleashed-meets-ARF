@@ -13,6 +13,9 @@ export 'src/model/discovered.dart';
 export 'src/model/enums.dart';
 export 'src/model/device.dart';
 export 'src/model/exceptions.dart';
+// Only the public transport error types; the Transport machinery stays internal.
+export 'src/transport/transport.dart'
+    show FlipperTransportError, FlipperBondMismatchError;
 export 'src/common/log.dart';
 export 'src/model/connect_error.dart';
 export 'src/dfu/backend.dart';
