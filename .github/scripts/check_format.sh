@@ -4,12 +4,13 @@
 #   check_format.sh            # fail if anything would change
 #   check_format.sh --write    # format in place
 #
-# The file list comes from `git ls-files`, which is the right set for three
-# reasons: submodule contents under lib/modules are gitlinks rather than tracked
-# files, so flipperlib, dartufbt and the C++ tree are excluded without naming
-# them; generated files are gitignored, so lib/services/localization/gen and
+# The file list comes from `git ls-files`, which is the right set for two
+# reasons: generated files are gitignored, so lib/services/localization/gen and
 # firebase_options.dart are skipped; and a new directory is covered the day it
-# is added rather than needing to be enumerated here.
+# is added rather than needing to be enumerated here. Note that flipperlib and
+# dartufbt now live in-tree (no longer submodules), so their Dart is tracked and
+# format-checked too - keep it formatted or this check (once re-enabled in CI)
+# will flag it.
 #
 # `dart format` does not read the analyzer's exclude list, which is why this
 # cannot simply be `dart format lib test`.

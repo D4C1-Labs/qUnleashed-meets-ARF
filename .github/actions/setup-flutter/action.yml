@@ -61,9 +61,9 @@ runs:
     # suppresses the post-job save.
     #
     # It does not cover the two path dependencies: lib/modules/flipperlib and
-    # lib/modules/dartufbt record a version string and no hash, so a submodule
-    # whose code moved still satisfies the lockfile. What pins those is the
-    # gitlink plus `submodules: recursive` on every checkout.
+    # lib/modules/dartufbt record a version string and no hash. Those packages
+    # now live directly in this repository (no longer git submodules), so a
+    # plain checkout carries their exact committed code - nothing extra to pin.
     - name: Install Flutter dependencies
       shell: bash
       run: |

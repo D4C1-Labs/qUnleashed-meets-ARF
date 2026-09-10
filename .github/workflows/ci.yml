@@ -22,8 +22,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-        with:
-          submodules: recursive
 
       # All are pure bash and need neither Flutter nor the Firebase stub. They
       # run first so a broken setup cannot mask a regression in release logic.

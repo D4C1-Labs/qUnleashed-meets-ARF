@@ -1,0 +1,4 @@
+[submodule "proto/flipperzero"]
+	path = proto/flipperzero
+	url = https://github.com/DarkFlippers/flipperzero-protobuf.git
+	branch = dev
