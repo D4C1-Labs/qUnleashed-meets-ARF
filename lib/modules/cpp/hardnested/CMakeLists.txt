@@ -46,7 +46,10 @@ set_target_properties(qunleashed_hardnested PROPERTIES
 # crapto1 in a single binary (Apple). The Apple podspec applies the same flag.
 if(MSVC)
   target_compile_options(qunleashed_hardnested PRIVATE
-    "/FI${CMAKE_CURRENT_SOURCE_DIR}/hn_namespace.h")
+    "/FI${CMAKE_CURRENT_SOURCE_DIR}/hn_namespace.h"
+    # MSVC does not enable C11 <stdatomic.h> by default (vcruntime_c11_stdatomic.h
+    # hard-errors otherwise); the bruteforce core uses atomics. VS 2022 17.5+.
+    "/experimental:c11atomics")
 else()
   target_compile_options(qunleashed_hardnested PRIVATE
     -include "${CMAKE_CURRENT_SOURCE_DIR}/hn_namespace.h")

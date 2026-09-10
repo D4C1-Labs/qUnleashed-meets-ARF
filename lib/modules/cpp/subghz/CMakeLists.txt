@@ -45,3 +45,12 @@ endif()
 if(WIN32)
   target_compile_definitions(qunleashed_subghz PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
+
+# MSVC does not enable C11 <stdatomic.h> by default: vcruntime_c11_stdatomic.h
+# hard-errors with "C atomic support is not enabled" unless this switch is on
+# (available since VS 2022 17.5). The threaded Hitag2 and PSA kernels use
+# atomic_int / _Atomic, so MSVC needs it explicitly. clang-cl and MinGW support
+# C11 atomics natively and must not receive this MSVC-only flag.
+if(MSVC)
+  target_compile_options(qunleashed_subghz PRIVATE /experimental:c11atomics)
+endif()
