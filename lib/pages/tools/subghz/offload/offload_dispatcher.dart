@@ -1,7 +1,10 @@
 import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:flipperlib/flipperlib.dart';
+// flipperlib re-exports the Flipper RPC protobuf, which contains a generated
+// `DateTime` message that shadows dart:core's DateTime. Hide it so DateTime.now()
+// resolves to the core class.
+import 'package:flipperlib/flipperlib.dart' hide DateTime;
 
 import '../hitag2hell_recoverer.dart';
 import 'bf_protocol.dart';

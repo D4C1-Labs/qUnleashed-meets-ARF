@@ -75,10 +75,10 @@ class OffloadNotificationService {
     );
 
     await _plugin.show(
-      _notificationId,
-      title,
-      body,
-      NotificationDetails(
+      id: _notificationId,
+      title: title,
+      body: body,
+      notificationDetails: NotificationDetails(
         android: android,
         iOS: const DarwinNotificationDetails(presentAlert: false),
         macOS: const DarwinNotificationDetails(presentAlert: false),
@@ -98,10 +98,10 @@ class OffloadNotificationService {
       autoCancel: true,
     );
     await _plugin.show(
-      _notificationId,
-      'Offload finished',
-      message,
-      const NotificationDetails(
+      id: _notificationId,
+      title: 'Offload finished',
+      body: message,
+      notificationDetails: const NotificationDetails(
         android: android,
         iOS: DarwinNotificationDetails(presentAlert: true),
         macOS: DarwinNotificationDetails(presentAlert: true),
@@ -110,7 +110,7 @@ class OffloadNotificationService {
   }
 
   Future<void> _cancel() async {
-    await _plugin.cancel(_notificationId);
+    await _plugin.cancel(id: _notificationId);
   }
 
   Future<void> dispose() async {
