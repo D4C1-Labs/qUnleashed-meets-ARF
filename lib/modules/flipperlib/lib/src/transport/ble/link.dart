@@ -13,6 +13,11 @@ abstract class UniversalBleTransportBase extends Transport {
   static const String overflowCharUuid = '19ed82ae-ed21-4c9d-4145-228e63fe0000';
   static const String rpcStatusCharUuid =
       '19ed82ae-ed21-4c9d-4145-228e64fe0000';
+  // ARF custom-data offload channel (optional; absent on stock firmware).
+  static const String customDataRxCharUuid = // fe65: phone WRITES to Flipper
+      '19ed82ae-ed21-4c9d-4145-228e65fe0000';
+  static const String customDataTxCharUuid = // fe66: Flipper NOTIFIES phone
+      '19ed82ae-ed21-4c9d-4145-228e66fe0000';
   static const int _minBleMtuSize = 20;
   // Firmware RPC_BUFFER_SIZE (serial_service.c). The firmware resets this buffer
   // on a fresh connection and grants the full 1024-byte credit, so this is the
@@ -105,6 +110,17 @@ abstract class UniversalBleTransportBase extends Transport {
   String? _overflowCharId;
   String? _rpcStatusSvcId;
   String? _rpcStatusCharId;
+
+  // Custom-data channel for compute offload (PSA/KeeLoq brute-force). Optional:
+  // only the ARF firmware exposes fe65 (phone writes) / fe66 (Flipper notifies).
+  // fe66 notifications carry offload requests and are routed to a SEPARATE
+  // stream (customDataStream), not the RPC byte stream. fe65 is written via
+  // writeCustomData(). Both are null on stock firmware that lacks them.
+  String? _customRxSvcId; // fe65 (phone -> Flipper write)
+  String? _customRxCharId;
+  String? _customTxSvcId; // fe66 (Flipper -> phone notify)
+  String? _customTxCharId;
+  String? _customTxCharIdLower;
 
   late String _rxCharIdLower;
   late String _overflowCharIdLower;
@@ -291,6 +307,10 @@ abstract class UniversalBleTransportBase extends Transport {
     String? overflowChar;
     String? rpcStatusSvc;
     String? rpcStatusChar;
+    String? customRxSvc;
+    String? customRxChar;
+    String? customTxSvc;
+    String? customTxChar;
     var txWithResponse = true;
     var rxUsesIndicate = false;
 
@@ -320,6 +340,15 @@ abstract class UniversalBleTransportBase extends Transport {
           rpcStatusSvc = service.uuid;
           rpcStatusChar = char.uuid;
         }
+        // Optional ARF offload channel: never added to `missing` below.
+        if (cid == customDataRxCharUuid) {
+          customRxSvc = service.uuid;
+          customRxChar = char.uuid;
+        }
+        if (cid == customDataTxCharUuid) {
+          customTxSvc = service.uuid;
+          customTxChar = char.uuid;
+        }
       }
     }
 
@@ -348,12 +377,18 @@ abstract class UniversalBleTransportBase extends Transport {
     _overflowCharId = overflowChar;
     _rpcStatusSvcId = rpcStatusSvc;
     _rpcStatusCharId = rpcStatusChar;
+    _customRxSvcId = customRxSvc;
+    _customRxCharId = customRxChar;
+    _customTxSvcId = customTxSvc;
+    _customTxCharId = customTxChar;
+    _customTxCharIdLower = customTxChar?.toLowerCase();
     _rxCharIdLower = _rxCharId.toLowerCase();
     _overflowCharIdLower = _overflowCharId!.toLowerCase();
     _rpcStatusCharIdLower = _rpcStatusCharId!.toLowerCase();
     Log.info(
       '[BLE] configured: negotiatedMtu=$negotiatedMtu mtu=$bleMtuSize '
-      'txWithResponse=$_txWithResponse',
+      'txWithResponse=$_txWithResponse '
+      'offloadChannel=${_customTxCharId != null ? 'yes' : 'no'}',
     );
   }
 
@@ -372,6 +407,30 @@ abstract class UniversalBleTransportBase extends Transport {
   // no change to the write-with-response reliability. USB already uses 1024.
   @override
   int get storageChunkSize => _rpcBufferSize;
+
+  @override
+  bool get supportsOffload => _customTxCharId != null && _customRxCharId != null;
+
+  // Write a raw offload reply (progress/result/cancel-ack) to fe65. Best-effort,
+  // one un-chunked ATT write (all offload messages are <= 27 bytes, well under
+  // the firmware's 64-byte custom-data limit and the negotiated MTU). Separate
+  // from the RPC TX path — it does not touch the credit window or the RPC queue.
+  @override
+  Future<void> writeCustomData(Uint8List bytes) async {
+    final svc = _customRxSvcId;
+    final chr = _customRxCharId;
+    if (svc == null || chr == null) {
+      throw UnsupportedError('Offload channel (fe65) not available');
+    }
+    if (!isActive) {
+      throw StateError('BLE transport closed');
+    }
+    // fe65 supports write-without-response; use it for the lowest latency on
+    // these tiny, idempotent-at-the-app-level messages.
+    await _ops
+        .write(_device.device.deviceId, svc, chr, bytes, withoutResponse: true)
+        .timeout(_writeCallbackTimeout);
+  }
 
   @override
   Future<void> open() async {
@@ -661,6 +720,23 @@ abstract class UniversalBleTransportBase extends Transport {
         '($_rpcBufferSize) on fresh connection',
       );
     }
+
+    // 5. Optional: subscribe to the ARF custom-data offload channel (fe66).
+    // Best-effort — stock firmware lacks it, and a failure here must never
+    // break the RPC session. fe66 is ATTR_PERMISSION_NONE so it does not need
+    // the encrypted link, but subscribing here keeps setup in one place.
+    final customTxSvc = _customTxSvcId;
+    final customTxChr = _customTxCharId;
+    if (customTxSvc != null && customTxChr != null) {
+      try {
+        await _ops
+            .subscribeNotifications(deviceId, customTxSvc, customTxChr)
+            .timeout(const Duration(seconds: 4));
+        Log.info('[BLE] subscribed to offload channel (fe66)');
+      } catch (e) {
+        Log.info('[BLE] offload channel subscribe failed (non-fatal): $e');
+      }
+    }
   }
 
   // True when [e] signals the link dropped mid-setup (the _setupGuard error).
@@ -874,6 +950,13 @@ abstract class UniversalBleTransportBase extends Transport {
     }
     if (lower == _rpcStatusCharIdLower) {
       _applyRpcStatusValue(value);
+      return;
+    }
+    // Offload channel (fe66): route to the SEPARATE custom-data stream, never
+    // into the RPC byte pipe (addBytes) — these are raw binary BF messages, not
+    // protobuf RPC frames.
+    if (_customTxCharIdLower != null && lower == _customTxCharIdLower) {
+      addCustomData(value);
     }
   }
 

@@ -18,22 +18,37 @@
 
 #include "subghz_hitag2_hell.h"
 
-// Scalar 32-lane fallback kernel. Compiled ONLY when NEON is unavailable (e.g.
-// desktop x86 builds); on ARM/NEON targets the 128-lane kernel in
-// subghz_hitag2_hell_neon.c defines hitag2_hell_recover instead. Exactly one
-// translation unit provides the symbol.
-#if !defined(__ARM_NEON) && !defined(__ARM_NEON__)
+// This 128-lane NEON kernel is only compiled on ARM targets that have NEON
+// (Android arm64 / iOS / Apple Silicon). On every other target the whole
+// translation unit is empty and the 32-lane scalar kernel in
+// subghz_hitag2_hell_optb.c provides hitag2_hell_recover instead. Exactly one
+// of the two defines the symbol, so there is never a duplicate definition.
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
 
 #include <string.h>
+#include <arm_neon.h>
 
 // ---------------------------------------------------------------------------
-// Bitslice type (32-way SIMD across 32 lanes of a uint32_t)
+// Bitslice type (128-way SIMD across 128 lanes of a uint32x4_t NEON register)
 // ---------------------------------------------------------------------------
+//
+// This is the NEON-accelerated build. GCC/Clang treat native operators
+// (`^`, `|`, `&`, `~`) on vector types as element-wise operations, so all the
+// f_a_bs / f_b_bs / f_c_bs macros work unchanged. The wider slice means each
+// state[] entry holds 128 candidates simultaneously instead of 32, giving a
+// theoretical 4x speedup on hardware with 128-bit NEON (Cortex-A78 etc.).
 
-typedef uint32_t bitslice_t;
-#define BS_WIDTH 32U
-#define BS_ALL_ONES  ((bitslice_t)0xFFFFFFFFU)
-#define BS_ALL_ZEROS ((bitslice_t)0U)
+typedef uint32x4_t bitslice_t;
+#define BS_WIDTH 128U
+
+static inline bitslice_t bs_all_ones_val(void) {
+    return vdupq_n_u32(0xFFFFFFFFU);
+}
+static inline bitslice_t bs_all_zeros_val(void) {
+    return vdupq_n_u32(0U);
+}
+#define BS_ALL_ONES  (bs_all_ones_val())
+#define BS_ALL_ZEROS (bs_all_zeros_val())
 
 // Fiat V1 bitsliced filter macros. See docstring comments below and the
 // derivation notes in gen_filters.py.
@@ -92,9 +107,21 @@ static inline bitslice_t bs_from_bit(uint8_t b) {
     return b ? BS_ALL_ONES : BS_ALL_ZEROS;
 }
 
-// Extract lane `lane` (0..31) from a bitslice_t.
+// Extract lane `lane` (0..127) from a bitslice_t (128 bits total).
+// Layout: uint32x4_t = 4 uint32 lanes; each lane holds 32 candidates.
+// Global lane index `lane` (0..127) maps to (lane_word = lane/32, bit = lane%32).
 static inline uint8_t bs_get_lane(bitslice_t v, uint8_t lane) {
-    return (uint8_t)((v >> lane) & 1U);
+    uint32_t words[4];
+    vst1q_u32(words, v);
+    uint8_t w = (uint8_t)(lane >> 5);      // lane / 32
+    uint8_t b = (uint8_t)(lane & 0x1FU);   // lane % 32
+    return (uint8_t)((words[w] >> b) & 1U);
+}
+
+// Return true iff ALL 128 bits of the bitslice are zero. Uses NEON reduction:
+// `vmaxvq_u32(v) == 0` iff every element is 0.
+static inline bool bs_is_all_zero(bitslice_t v) {
+    return vmaxvq_u32(v) == 0U;
 }
 
 // Layer-0 scalar filter: pack a 48-bit state where only the 20 LAYER0_MASK
@@ -118,24 +145,42 @@ static inline uint64_t expand_layer0(uint32_t idx) {
 }
 
 // Precomputed lane-pattern bitslices for the L1 "spread" bits.
-// We spread 5 L1 bits across the 32 lanes so that each lane holds a unique
-// (bit0, bit1, bit2, bit3, bit4) triple:
-//   spread[0] = 0xAAAAAAAA  (lane bit0)
-//   spread[1] = 0xCCCCCCCC  (lane bit1)
-//   spread[2] = 0xF0F0F0F0  (lane bit2)
-//   spread[3] = 0xFF00FF00  (lane bit3)
-//   spread[4] = 0xFFFF0000  (lane bit4)
-static const bitslice_t k_spread_patterns[5] = {
-    0xAAAAAAAAU, 0xCCCCCCCCU, 0xF0F0F0F0U, 0xFF00FF00U, 0xFFFF0000U,
-};
+// With 128 lanes we can spread 7 L1 bits (2^7 = 128).
+// spread[i] is the pattern where lane L has bit i set iff (L >> i) & 1.
+// Layout of a uint32x4_t: 4 uint32 lanes = 128 bits total, indexed 0..127.
+static inline bitslice_t make_spread_pattern(uint8_t bit_i) {
+    // For bit i (0..6), the pattern over 128 lanes has bit L set iff (L>>i)&1.
+    uint32_t w[4];
+    for(uint8_t w_i = 0; w_i < 4; w_i++) {
+        uint32_t v = 0;
+        for(uint8_t b_i = 0; b_i < 32; b_i++) {
+            uint32_t lane = (uint32_t)w_i * 32U + b_i;
+            if((lane >> bit_i) & 1U) v |= (1U << b_i);
+        }
+        w[w_i] = v;
+    }
+    return vld1q_u32(w);
+}
 
-// Which 5 L1 bits get bitsliced-spread (indices into k_layer1_bits[]).
-// Choose the 5 highest-index positions so they occupy widely-separated state[]
-// slots. This is somewhat arbitrary; any 5 choices work.
-static const uint8_t k_layer1_spread_sel[5] = {9, 10, 11, 12, 13}; // -> layer1 bits {31, 34, 38, 40, 43}
+// Lazy-initialized on first use. Not thread-safe on the FIRST call, but the
+// values are pure functions of the bit index so all threads compute the same
+// thing; worst case a data race writes identical bytes.
+static bool k_spread_initialized = false;
+static bitslice_t k_spread_patterns[7];
 
-// The remaining 9 L1 bits (scalar-iterated).
-static const uint8_t k_layer1_scalar_sel[9] = {0, 1, 2, 3, 4, 5, 6, 7, 8}; // -> {0,2,12,15,17,20,23,25,29}
+static void init_spread_patterns_once(void) {
+    if(k_spread_initialized) return;
+    for(uint8_t i = 0; i < 7; i++) k_spread_patterns[i] = make_spread_pattern(i);
+    k_spread_initialized = true;
+}
+
+// Which 7 L1 bits get bitsliced-spread (indices into k_layer1_bits[]).
+// Choose the 7 highest-index positions so they occupy widely-separated state[]
+// slots. This is somewhat arbitrary; any 7 choices work.
+static const uint8_t k_layer1_spread_sel[7] = {7, 8, 9, 10, 11, 12, 13}; // -> layer1 bits {25,29,31,34,38,40,43}
+
+// The remaining 7 L1 bits (scalar-iterated).
+static const uint8_t k_layer1_scalar_sel[7] = {0, 1, 2, 3, 4, 5, 6}; // -> {0,2,12,15,17,20,23}
 
 // ---------------------------------------------------------------------------
 // Deep search routine (layers 2..31) for one layer-0 candidate.
@@ -178,10 +223,49 @@ static void emit_candidate(Hitag2HellResult* result, uint64_t state31) {
 // after layer 8).
 // ---------------------------------------------------------------------------
 
-// Per-round specialized kernels with compile-time-constant indices, plus the
-// bs_filter_at()/bs_lfsr_at() switch-dispatchers (used where r is variable).
-// See gen_hell_kernels.py. Bit-identical to the original runtime-index code.
-#include "hell_kernels_gen.h"
+// Compute filter output at round r, given fully-populated state[0..N] bitslices.
+static bitslice_t bs_filter_at(const bitslice_t state[STATE_ARR_LEN], uint8_t r) {
+    // Group bit-positions per round r (position p in S_r maps to state[p-r] or
+    // state[47+r-p]). This mirrors the scalar hitag2_fiat_filter.
+    static const int8_t group_pos[5][4] = {
+        {41, 42, 44, 45},
+        {32, 33, 35, 39},
+        {21, 24, 26, 30},
+        {14, 16, 18, 19},
+        { 1,  3,  4, 13},
+    };
+    static const bool is_fa[5] = {true, false, false, false, true};
+
+    bitslice_t g[5];
+    for(uint8_t gi = 0; gi < 5U; gi++) {
+        uint8_t idx[4];
+        for(uint8_t k = 0; k < 4U; k++) {
+            int8_t p = group_pos[gi][k];
+            idx[k] = (uint8_t)((p >= r) ? (p - r) : (47 + r - p));
+        }
+        // truth(fa or fb, fi(bit[idx0],...,bit[idx3])) == f_x_bs(bit[idx3],...,bit[idx0])
+        bitslice_t a = state[idx[3]];
+        bitslice_t b = state[idx[2]];
+        bitslice_t c = state[idx[1]];
+        bitslice_t d = state[idx[0]];
+        g[gi] = is_fa[gi] ? f_a_bs(a, b, c, d) : f_b_bs(a, b, c, d);
+    }
+    return f_c_bs(g[0], g[1], g[2], g[3], g[4]);
+}
+
+// Compute state[48+r] = LFSR feedback at round r (deterministic once all the
+// input state[] bits are known).
+static bitslice_t bs_lfsr_at(const bitslice_t state[STATE_ARR_LEN], uint8_t r) {
+    // LFSR taps in state at round r: positions {0,1,4,5,6,17,21,24,25,31,39,40,41,44,45,47}.
+    static const uint8_t taps[16] = {0, 1, 4, 5, 6, 17, 21, 24, 25, 31, 39, 40, 41, 44, 45, 47};
+    bitslice_t v = BS_ALL_ZEROS;
+    for(uint8_t i = 0; i < 16U; i++) {
+        uint8_t p = taps[i];
+        uint8_t idx = (uint8_t)((p >= r) ? (p - r) : (47 + r - p));
+        v ^= state[idx];
+    }
+    return v;
+}
 
 // ---------------------------------------------------------------------------
 // Deep search: enters with state[] populated with L0+L1(spread+scalar) bits.
@@ -199,59 +283,59 @@ static bool deep_search(
         for(uint8_t k = 0; k < 5U; k++) {
             state[k_layer2_bits[k]] = bs_from_bit((i2 >> k) & 1U);
         }
-        bitslice_t f2 = bs_filter_at_r2(state);
+        bitslice_t f2 = bs_filter_at(state, 2);
         bitslice_t alive2 = alive_mask & ~(f2 ^ ctx->keystream[2]);
-        if(alive2 == 0) continue;
+        if(bs_is_all_zero(alive2)) continue;
 
         // Layer 3: 4 bits, 16 combinations
         for(uint32_t i3 = 0; i3 < (1U << 4); i3++) {
             for(uint8_t k = 0; k < 4U; k++) {
                 state[k_layer3_bits[k]] = bs_from_bit((i3 >> k) & 1U);
             }
-            bitslice_t f3 = bs_filter_at_r3(state);
+            bitslice_t f3 = bs_filter_at(state, 3);
             bitslice_t alive3 = alive2 & ~(f3 ^ ctx->keystream[3]);
-            if(alive3 == 0) continue;
+            if(bs_is_all_zero(alive3)) continue;
 
             // Layer 4: 2 bits
             for(uint32_t i4 = 0; i4 < (1U << 2); i4++) {
                 for(uint8_t k = 0; k < 2U; k++) {
                     state[k_layer4_bits[k]] = bs_from_bit((i4 >> k) & 1U);
                 }
-                bitslice_t f4 = bs_filter_at_r4(state);
+                bitslice_t f4 = bs_filter_at(state, 4);
                 bitslice_t alive4 = alive3 & ~(f4 ^ ctx->keystream[4]);
-                if(alive4 == 0) continue;
+                if(bs_is_all_zero(alive4)) continue;
 
                 for(uint32_t i5 = 0; i5 < (1U << 2); i5++) {
                     for(uint8_t k = 0; k < 2U; k++) {
                         state[k_layer5_bits[k]] = bs_from_bit((i5 >> k) & 1U);
                     }
-                    bitslice_t f5 = bs_filter_at_r5(state);
+                    bitslice_t f5 = bs_filter_at(state, 5);
                     bitslice_t alive5 = alive4 & ~(f5 ^ ctx->keystream[5]);
-                    if(alive5 == 0) continue;
+                    if(bs_is_all_zero(alive5)) continue;
 
                     for(uint32_t i6 = 0; i6 < (1U << 2); i6++) {
                         for(uint8_t k = 0; k < 2U; k++) {
                             state[k_layer6_bits[k]] = bs_from_bit((i6 >> k) & 1U);
                         }
-                        bitslice_t f6 = bs_filter_at_r6(state);
+                        bitslice_t f6 = bs_filter_at(state, 6);
                         bitslice_t alive6 = alive5 & ~(f6 ^ ctx->keystream[6]);
-                        if(alive6 == 0) continue;
+                        if(bs_is_all_zero(alive6)) continue;
 
                         for(uint32_t i7 = 0; i7 < (1U << 2); i7++) {
                             for(uint8_t k = 0; k < 2U; k++) {
                                 state[k_layer7_bits[k]] = bs_from_bit((i7 >> k) & 1U);
                             }
-                            bitslice_t f7 = bs_filter_at_r7(state);
+                            bitslice_t f7 = bs_filter_at(state, 7);
                             bitslice_t alive7 = alive6 & ~(f7 ^ ctx->keystream[7]);
-                            if(alive7 == 0) continue;
+                            if(bs_is_all_zero(alive7)) continue;
 
                             for(uint32_t i8 = 0; i8 < (1U << 2); i8++) {
                                 for(uint8_t k = 0; k < 2U; k++) {
                                     state[k_layer8_bits[k]] = bs_from_bit((i8 >> k) & 1U);
                                 }
-                                bitslice_t f8 = bs_filter_at_r8(state);
+                                bitslice_t f8 = bs_filter_at(state, 8);
                                 bitslice_t alive8 = alive7 & ~(f8 ^ ctx->keystream[8]);
-                                if(alive8 == 0) continue;
+                                if(bs_is_all_zero(alive8)) continue;
 
                                 // At this point state[0..45] and state[48..54] are set.
                                 // state[46] and state[47] are NOT constrained by any
@@ -285,61 +369,29 @@ static bool deep_search(
                                     state[46] = state[49] ^ v;
                                 }
                                 // Now state[0..54] all set.
-                                 // Verify LFSR consistency for rounds 2..6 (state[50..54]).
-                                 // Any lane inconsistent means the guesses were wrong.
-                                 // Fully unrolled with per-round specialized kernels.
-#define HELL_LFSR_VERIFY(R)                                              \
-    alive8 &= ~(bs_lfsr_at_r##R(state) ^ state[48 + (R)]);              \
-    if(alive8 == 0) goto lfsr_verify_done;
-                                 HELL_LFSR_VERIFY(2)
-                                 HELL_LFSR_VERIFY(3)
-                                 HELL_LFSR_VERIFY(4)
-                                 HELL_LFSR_VERIFY(5)
-                                 HELL_LFSR_VERIFY(6)
-#undef HELL_LFSR_VERIFY
-                                 lfsr_verify_done:
-                                 if(alive8 == 0) continue;
-                                 // Compute state[55..79] via LFSR (deterministic).
-                                 // Fully unrolled with per-round specialized kernels.
-#define HELL_LFSR_COMPUTE(R) state[48 + (R)] = bs_lfsr_at_r##R(state);
-                                 HELL_LFSR_COMPUTE(7)  HELL_LFSR_COMPUTE(8)
-                                 HELL_LFSR_COMPUTE(9)  HELL_LFSR_COMPUTE(10)
-                                 HELL_LFSR_COMPUTE(11) HELL_LFSR_COMPUTE(12)
-                                 HELL_LFSR_COMPUTE(13) HELL_LFSR_COMPUTE(14)
-                                 HELL_LFSR_COMPUTE(15) HELL_LFSR_COMPUTE(16)
-                                 HELL_LFSR_COMPUTE(17) HELL_LFSR_COMPUTE(18)
-                                 HELL_LFSR_COMPUTE(19) HELL_LFSR_COMPUTE(20)
-                                 HELL_LFSR_COMPUTE(21) HELL_LFSR_COMPUTE(22)
-                                 HELL_LFSR_COMPUTE(23) HELL_LFSR_COMPUTE(24)
-                                 HELL_LFSR_COMPUTE(25) HELL_LFSR_COMPUTE(26)
-                                 HELL_LFSR_COMPUTE(27) HELL_LFSR_COMPUTE(28)
-                                 HELL_LFSR_COMPUTE(29) HELL_LFSR_COMPUTE(30)
-                                 HELL_LFSR_COMPUTE(31)
-#undef HELL_LFSR_COMPUTE
-                                 // Filter rounds 9..31 check.
-                                 // Fully unrolled with per-round specialized kernels.
-#define HELL_FILTER_CHECK(R)                                             \
-    alive8 &= ~(bs_filter_at_r##R(state) ^ ctx->keystream[R]);          \
-    if(alive8 == 0) goto filter_check_done;
-                                 HELL_FILTER_CHECK(9)  HELL_FILTER_CHECK(10)
-                                 HELL_FILTER_CHECK(11) HELL_FILTER_CHECK(12)
-                                 HELL_FILTER_CHECK(13) HELL_FILTER_CHECK(14)
-                                 HELL_FILTER_CHECK(15) HELL_FILTER_CHECK(16)
-                                 HELL_FILTER_CHECK(17) HELL_FILTER_CHECK(18)
-                                 HELL_FILTER_CHECK(19) HELL_FILTER_CHECK(20)
-                                 HELL_FILTER_CHECK(21) HELL_FILTER_CHECK(22)
-                                 HELL_FILTER_CHECK(23) HELL_FILTER_CHECK(24)
-                                 HELL_FILTER_CHECK(25) HELL_FILTER_CHECK(26)
-                                 HELL_FILTER_CHECK(27) HELL_FILTER_CHECK(28)
-                                 HELL_FILTER_CHECK(29) HELL_FILTER_CHECK(30)
-                                 HELL_FILTER_CHECK(31)
-#undef HELL_FILTER_CHECK
-                                 filter_check_done:;
-                                if(alive8 == 0) continue;
+                                // Verify LFSR consistency for rounds 2..6 (state[50..54]).
+                                // Any lane inconsistent means the guesses were wrong.
+                                for(uint8_t r = 2; r < 7U; r++) {
+                                    bitslice_t expected = bs_lfsr_at(state, r);
+                                    alive8 &= ~(expected ^ state[48 + r]);
+                                    if(bs_is_all_zero(alive8)) break;
+                                }
+                                if(bs_is_all_zero(alive8)) continue;
+                                // Compute state[55..79] via LFSR (deterministic).
+                                for(uint8_t r = 7; r < 32U; r++) {
+                                    state[48 + r] = bs_lfsr_at(state, r);
+                                }
+                                // Filter rounds 9..31 check.
+                                for(uint8_t r = 9; r < 32U; r++) {
+                                    bitslice_t fr = bs_filter_at(state, r);
+                                    alive8 &= ~(fr ^ ctx->keystream[r]);
+                                    if(bs_is_all_zero(alive8)) break;
+                                }
+                                if(bs_is_all_zero(alive8)) continue;
 
                                 // Any surviving lanes are candidates.
                                 for(uint8_t lane = 0; lane < BS_WIDTH; lane++) {
-                                    if(!((alive8 >> lane) & 1U)) continue;
+                                    if(!bs_get_lane(alive8, lane)) continue;
                                     uint64_t state31 = extract_state31(state, lane);
                                     emit_candidate(ctx->result, state31);
                                     if(ctx->result->overflow) return true;
@@ -416,30 +468,34 @@ bool hitag2_hell_recover(
         for(uint8_t k = 0; k < 20U; k++) {
             state[k_layer0_bits[k]] = bs_from_bit((uint8_t)((s0 >> k_layer0_bits[k]) & 1U));
         }
-        // L1 spread bits: 5 patterns
-        for(uint8_t k = 0; k < 5U; k++) {
+        // L1 spread bits: 7 patterns (128-way NEON version)
+        init_spread_patterns_once();
+        for(uint8_t k = 0; k < 7U; k++) {
             uint8_t bit_pos = k_layer1_bits[k_layer1_spread_sel[k]];
             state[bit_pos] = k_spread_patterns[k];
         }
 
-        // Iterate the 9 scalar L1 bits: 512 combinations.
-        for(uint32_t i1 = 0; i1 < (1U << 9); i1++) {
-            for(uint8_t k = 0; k < 9U; k++) {
+        // Iterate the 7 scalar L1 bits: 128 combinations (was 9 bits / 512 in
+        // the 32-way build; we moved 2 more bits into the wider bitslice).
+        for(uint32_t i1 = 0; i1 < (1U << 7); i1++) {
+            for(uint8_t k = 0; k < 7U; k++) {
                 uint8_t bit_pos = k_layer1_bits[k_layer1_scalar_sel[k]];
                 state[bit_pos] = bs_from_bit((uint8_t)((i1 >> k) & 1U));
             }
 
             // Round-1 filter check.
-            bitslice_t f1 = bs_filter_at_r1(state);
+            bitslice_t f1 = bs_filter_at(state, 1);
             bitslice_t alive = ~(f1 ^ keystream[1]);
-            if(alive == 0) continue;
+            if(bs_is_all_zero(alive)) continue;
 
             // Descend into layers 2..31.
             deep_search(&ctx, state, alive);
             if(result->overflow) break;
         }
 
-        ctx.states_tested += (1U << 9);
+        // 7 spread * 7 scalar = 128 * 128 = 16384 states per L0 candidate
+        // (was 32 * 512 = 16384 in the 32-way build; unchanged total).
+        ctx.states_tested += (1U << 7) * BS_WIDTH;
 
         if(i0 >= next_progress) {
             next_progress += progress_step;
@@ -528,4 +584,4 @@ bool hitag2_hell_self_test(void) {
     return true;
 }
 
-#endif // !__ARM_NEON
+#endif // __ARM_NEON

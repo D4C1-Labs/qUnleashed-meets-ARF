@@ -30,6 +30,14 @@ typedef struct {
 
     uint32_t total_slots; // l0_end - l0_start (for pct)
 
+    // Work-stealing cursor over [l0_base, l0_limit). Every worker atomically
+    // grabs the next WORK_CHUNK slots from here, so fast (big) cores naturally
+    // process more chunks than slow (little) cores and no core sits idle at the
+    // end — the fix for the uniform-split big.LITTLE stall.
+    uint32_t l0_base;
+    uint32_t l0_limit;
+    atomic_uint_least32_t next_slot;
+
     atomic_int found;                // 1 once the real key is committed
     atomic_uint_least64_t slots_done; // cumulative across workers
     volatile int32_t* cancel;         // external cancel (may be NULL)
@@ -87,14 +95,16 @@ static bool hitag2_worker_progress_cb(uint8_t pct, uint64_t states_tested, void*
     return true;
 }
 
+// Slots grabbed per atomic fetch. Small enough that big/little cores stay
+// balanced and cancel stays responsive; large enough that the atomic and the
+// per-call kernel setup are amortized over real work.
+#define HITAG2_WORK_CHUNK 64U
+
 static void* hitag2_worker_main(void* arg) {
     Hitag2Worker* w = (Hitag2Worker*)arg;
     Hitag2Shared* sh = w->sh;
 
-    // Small sub-chunks: better cancel responsiveness + progress granularity.
-    const uint32_t SUBCHUNK = 8;
-
-    for(uint32_t base = w->l0_start; base < w->l0_end; base += SUBCHUNK) {
+    for(;;) {
         if(atomic_load_explicit(&sh->found, memory_order_relaxed)) break;
         if(atomic_load_explicit(&sh->abort_all, memory_order_relaxed)) break;
         if(sh->cancel && *sh->cancel) {
@@ -102,8 +112,13 @@ static void* hitag2_worker_main(void* arg) {
             break;
         }
 
-        uint32_t end = base + SUBCHUNK;
-        if(end > w->l0_end) end = w->l0_end;
+        // Grab the next chunk of the L0 space. Whoever is free takes the next
+        // work, so throughput follows real per-core speed automatically.
+        uint32_t base = atomic_fetch_add_explicit(
+            &sh->next_slot, HITAG2_WORK_CHUNK, memory_order_relaxed);
+        if(base >= sh->l0_limit) break;
+        uint32_t end = base + HITAG2_WORK_CHUNK;
+        if(end > sh->l0_limit) end = sh->l0_limit;
 
         Hitag2HellConfig cfg;
         memset(&cfg, 0, sizeof(cfg));
@@ -177,6 +192,9 @@ bool hitag2_threaded_recover(
     sh.caps = caps;
     sh.capture_count = capture_count;
     sh.total_slots = span;
+    sh.l0_base = l0_start;
+    sh.l0_limit = l0_end;
+    atomic_init(&sh.next_slot, l0_start);
     atomic_init(&sh.found, 0);
     atomic_init(&sh.slots_done, 0);
     atomic_init(&sh.abort_all, 0);
@@ -194,14 +212,12 @@ bool hitag2_threaded_recover(
         return false;
     }
 
-    // Uniform partition.
-    uint32_t per = span / (uint32_t)n;
-    uint32_t cursor = l0_start;
+    // Work-stealing: all workers are identical and pull chunks from the shared
+    // cursor. No fixed per-thread range, so a fast core simply grabs more.
     for(int i = 0; i < n; i++) {
         workers[i].sh = &sh;
-        workers[i].l0_start = cursor;
-        workers[i].l0_end = (i == n - 1) ? l0_end : (cursor + per);
-        cursor = workers[i].l0_end;
+        workers[i].l0_start = l0_start;
+        workers[i].l0_end = l0_end;
         workers[i].is_leader = (i == 0);
         workers[i].last_slots = 0;
     }

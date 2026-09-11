@@ -247,6 +247,10 @@ static inline int psa_try_bf1(
             psa_unpack_tea_result_to_buffer(buffer, dec_v0, dec_v1);
             psa_extract_fields_mode36(buffer, out);
             out->serial = counter;
+            // Raw hit values for the BLE offload reply.
+            out->bf_counter = counter;
+            out->dec_v0 = dec_v0;
+            out->dec_v1 = dec_v1;
             return 1;
         }
     }
@@ -280,6 +284,10 @@ static inline int psa_try_bf2(uint32_t counter, uint32_t w0, uint32_t w1, PsaRes
         if(crc16 == expected_crc) {
             psa_extract_fields_mode36(buffer, out);
             out->serial = counter;
+            // Raw hit values for the BLE offload reply.
+            out->bf_counter = counter;
+            out->dec_v0 = dec_v0;
+            out->dec_v1 = dec_v1;
             return 1;
         }
     }
@@ -350,28 +358,17 @@ static void* psa_worker_main(void* arg) {
     return NULL;
 }
 
-bool psa_bruteforce_run(
-    const uint8_t key1[8],
-    const uint8_t key2[8],
+// Core sweep: brute-force the TEA plaintext words (w0, w1) across BF1+BF2,
+// multi-threaded. Both the key-based entry point and the BLE offload entry
+// point funnel through here so the threading/progress/cancel logic lives once.
+static bool psa_bruteforce_run_core(
+    uint32_t w0,
+    uint32_t w1,
     PsaResult* out,
     PsaProgressFn progress,
     void* progress_ctx,
     volatile int32_t* cancel) {
-    if(!key1 || !key2 || !out) return false;
-
-    // Reconstruct the (key1_low, key1_high, key2_low) triple the firmware uses.
-    // key1[] is the 8-byte little-endian key1 value; key2[] the 8-byte key2,
-    // of which only the low 16 bits feed the buffer.
-    uint32_t key1_low = (uint32_t)key1[0] | ((uint32_t)key1[1] << 8) |
-                        ((uint32_t)key1[2] << 16) | ((uint32_t)key1[3] << 24);
-    uint32_t key1_high = (uint32_t)key1[4] | ((uint32_t)key1[5] << 8) |
-                         ((uint32_t)key1[6] << 16) | ((uint32_t)key1[7] << 24);
-    uint32_t key2_low = (uint32_t)key2[0] | ((uint32_t)key2[1] << 8);
-
-    uint8_t buffer[48] = {0};
-    psa_setup_byte_buffer(buffer, key1_low, key1_high, key2_low);
-    uint32_t w0, w1;
-    psa_prepare_tea_data(buffer, &w0, &w1);
+    if(!out) return false;
 
     int n = subghz_num_cpus();
     if(n < 1) n = 1;
@@ -419,4 +416,40 @@ bool psa_bruteforce_run(
     free(workers);
     free(tids);
     return found != 0;
+}
+
+bool psa_bruteforce_run(
+    const uint8_t key1[8],
+    const uint8_t key2[8],
+    PsaResult* out,
+    PsaProgressFn progress,
+    void* progress_ctx,
+    volatile int32_t* cancel) {
+    if(!key1 || !key2 || !out) return false;
+
+    // Reconstruct the (key1_low, key1_high, key2_low) triple the firmware uses.
+    // key1[] is the 8-byte little-endian key1 value; key2[] the 8-byte key2,
+    // of which only the low 16 bits feed the buffer.
+    uint32_t key1_low = (uint32_t)key1[0] | ((uint32_t)key1[1] << 8) |
+                        ((uint32_t)key1[2] << 16) | ((uint32_t)key1[3] << 24);
+    uint32_t key1_high = (uint32_t)key1[4] | ((uint32_t)key1[5] << 8) |
+                         ((uint32_t)key1[6] << 16) | ((uint32_t)key1[7] << 24);
+    uint32_t key2_low = (uint32_t)key2[0] | ((uint32_t)key2[1] << 8);
+
+    uint8_t buffer[48] = {0};
+    psa_setup_byte_buffer(buffer, key1_low, key1_high, key2_low);
+    uint32_t w0, w1;
+    psa_prepare_tea_data(buffer, &w0, &w1);
+
+    return psa_bruteforce_run_core(w0, w1, out, progress, progress_ctx, cancel);
+}
+
+bool psa_bruteforce_run_words(
+    uint32_t w0,
+    uint32_t w1,
+    PsaResult* out,
+    PsaProgressFn progress,
+    void* progress_ctx,
+    volatile int32_t* cancel) {
+    return psa_bruteforce_run_core(w0, w1, out, progress, progress_ctx, cancel);
 }

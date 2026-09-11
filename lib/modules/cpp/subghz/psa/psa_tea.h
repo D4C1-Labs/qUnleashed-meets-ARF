@@ -22,6 +22,14 @@ typedef struct {
     uint32_t counter; // decrypted_counter
     uint8_t button;   // decrypted_button
     uint8_t type;     // decrypted_type (0x36)
+    // Raw brute-force hit values, needed by the BLE offload path which reports
+    // (counter, dec_v0, dec_v1) straight back to the Flipper firmware instead
+    // of the extracted mode-0x36 fields. bf_counter is the winning counter (the
+    // same value stored in `serial` by the sweep); dec_v0/dec_v1 are the TEA
+    // plaintext words after decryption with the winning working key.
+    uint32_t bf_counter;
+    uint32_t dec_v0;
+    uint32_t dec_v1;
 } PsaResult;
 
 // Progress callback. pct 0..100 over the 32M keyspace, keys_tested = cumulative.
@@ -37,6 +45,18 @@ typedef bool (*PsaProgressFn)(uint8_t pct, uint64_t keys_tested, void* ctx);
 bool psa_bruteforce_run(
     const uint8_t key1[8],
     const uint8_t key2[8],
+    PsaResult* out,
+    PsaProgressFn progress,
+    void* progress_ctx,
+    volatile int32_t* cancel);
+
+// BLE offload variant: brute-force the raw TEA plaintext words (w0, w1) sent by
+// the Flipper firmware directly, instead of deriving them from key1/key2. On a
+// hit, out->bf_counter / out->dec_v0 / out->dec_v1 carry the values the firmware
+// expects back (see the PSA offload BLE protocol). Returns true if found.
+bool psa_bruteforce_run_words(
+    uint32_t w0,
+    uint32_t w1,
     PsaResult* out,
     PsaProgressFn progress,
     void* progress_ctx,

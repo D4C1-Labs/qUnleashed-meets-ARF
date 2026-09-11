@@ -85,3 +85,8 @@ app.*.map.json
 /android/app/google-services.json
 /ios/Runner/GoogleService-Info.plist
 /macos/Runner/GoogleService-Info.plist
+
+# Native (C/C++) build artifacts. The native libs are built by CMake/NDK into
+# platform build dirs (already ignored); loose object files are never committed.
+*.o
+*.obj

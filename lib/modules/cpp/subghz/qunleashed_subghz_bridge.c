@@ -15,6 +15,7 @@
 
 #include "psa/psa_tea.h"
 #include "keeloq/keeloq.h"
+#include "keeloq/keeloq_bruteforce.h"
 #include "hitag2/hitag2_threaded.h"
 
 #if defined(_WIN32)
@@ -88,6 +89,39 @@ QUNLEASHED_EXPORT int qunleashed_psa_bruteforce(
     return 0;
 }
 
+// BLE offload variant. The Flipper firmware sends the raw TEA plaintext words
+// (w0, w1) and expects (counter, dec_v0, dec_v1) back. Returns 0 on success
+// (*found=1, out_counter/out_dec_v0/out_dec_v1 filled), -2 on bad args, -10 when
+// no key was found (*found=0). Same shared-memory progress/cancel model.
+QUNLEASHED_EXPORT int qunleashed_psa_bruteforce_offload(
+    uint32_t w0,
+    uint32_t w1,
+    uint32_t* out_counter,
+    uint32_t* out_dec_v0,
+    uint32_t* out_dec_v1,
+    int32_t* found,
+    uint64_t* progress_out,
+    volatile int32_t* cancel) {
+    if(found) *found = 0;
+
+    PsaBridgeCtx bctx = {progress_out, cancel};
+    PsaResult res;
+    memset(&res, 0, sizeof(res));
+
+    bool ok = psa_bruteforce_run_words(
+        w0, w1, &res, psa_bridge_progress, &bctx, cancel);
+
+    if(!ok) {
+        if(found) *found = 0;
+        return -10;
+    }
+    if(out_counter) *out_counter = res.bf_counter;
+    if(out_dec_v0) *out_dec_v0 = res.dec_v0;
+    if(out_dec_v1) *out_dec_v1 = res.dec_v1;
+    if(found) *found = 1;
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // KeeLoq (single-shot, no threads)
 // ---------------------------------------------------------------------------
@@ -97,6 +131,75 @@ QUNLEASHED_EXPORT uint32_t qunleashed_keeloq_decrypt(uint32_t hop, uint64_t key)
 
 QUNLEASHED_EXPORT uint32_t qunleashed_keeloq_encrypt(uint32_t data, uint64_t key) {
     return subghz_protocol_keeloq_common_encrypt(data, key);
+}
+
+// ---------------------------------------------------------------------------
+// KeeLoq manufacturer-key brute-force (heavy, multithread)
+// ---------------------------------------------------------------------------
+// Same shared-memory progress model as PSA. On return, up to max_candidates
+// entries are written to the caller-provided flat arrays (parallel arrays, one
+// slot per candidate). Returns the number of candidates found. cancel/progress
+// as usual. learning_type 6/7/8; the Dart side runs the 6->7->8 "auto" sequence
+// as three calls when the firmware requests learning_type 0.
+typedef struct {
+    volatile uint64_t* progress_out;
+    volatile int32_t* cancel;
+} KeeloqBridgeCtx;
+
+static bool keeloq_bridge_progress(uint8_t pct, uint64_t keys_tested, void* raw) {
+    KeeloqBridgeCtx* b = (KeeloqBridgeCtx*)raw;
+    if(b->progress_out) {
+        *b->progress_out =
+            (((uint64_t)pct & 0xFFULL) << 56) | (keys_tested & 0x00FFFFFFFFFFFFFFULL);
+    }
+    if(b->cancel && *b->cancel) return false;
+    return true;
+}
+
+QUNLEASHED_EXPORT int qunleashed_keeloq_bruteforce(
+    int learning_type,
+    uint32_t serial,
+    uint32_t fix,
+    uint32_t hop1,
+    uint32_t hop2,
+    int max_candidates,
+    uint64_t* out_mfkeys, // [max_candidates]
+    uint64_t* out_devkeys, // [max_candidates]
+    uint32_t* out_counters, // [max_candidates]
+    uint8_t* out_learn_types, // [max_candidates]
+    uint64_t* progress_out,
+    volatile int32_t* cancel) {
+    if(!out_mfkeys || !out_devkeys || !out_counters || !out_learn_types ||
+       max_candidates <= 0) {
+        return -2;
+    }
+
+    KeeloqCandidate* cands =
+        (KeeloqCandidate*)calloc((size_t)max_candidates, sizeof(KeeloqCandidate));
+    if(!cands) return -2;
+
+    KeeloqBridgeCtx bctx = {progress_out, cancel};
+    int found = keeloq_bruteforce_run(
+        learning_type,
+        serial,
+        fix,
+        hop1,
+        hop2,
+        cands,
+        max_candidates,
+        keeloq_bridge_progress,
+        &bctx,
+        cancel);
+
+    for(int i = 0; i < found && i < max_candidates; i++) {
+        out_mfkeys[i] = cands[i].mfkey;
+        out_devkeys[i] = cands[i].devkey;
+        out_counters[i] = cands[i].counter;
+        out_learn_types[i] = cands[i].learn_type;
+    }
+
+    free(cands);
+    return found;
 }
 
 // ---------------------------------------------------------------------------

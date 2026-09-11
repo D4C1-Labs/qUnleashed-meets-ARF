@@ -11,8 +11,10 @@ add_library(qunleashed_subghz SHARED
   subghz_util.c
   psa/psa_tea.c
   keeloq/keeloq.c
+  keeloq/keeloq_bruteforce.c
   hitag2/subghz_hitag2_core.c
   hitag2/subghz_hitag2_hell_optb.c
+  hitag2/subghz_hitag2_hell_neon.c
   hitag2/fiat_v1_ref.c
   hitag2/hitag2_threaded.c
 )
@@ -28,9 +30,13 @@ set_target_properties(qunleashed_subghz PROPERTIES
   C_VISIBILITY_PRESET hidden
 )
 
-# Perf: -O3 on GCC/Clang. MSVC uses its own default optimization. The vector /
-# NEON / SSE2 code paths in the Hell kernel use the same GCC/Clang vector_size
-# pattern as the hardnested engine (auto-vectorized at -O3).
+# Perf: -O3 on GCC/Clang. MSVC uses its own default optimization.
+# The Hitag2Hell kernel exists in two builds selected at compile time by the
+# __ARM_NEON macro: subghz_hitag2_hell_neon.c (128-lane uint32x4_t NEON, used on
+# Android arm64 / iOS / Apple Silicon) and subghz_hitag2_hell_optb.c (32-lane
+# scalar fallback for x86 desktop). The NEON build is ~4x faster than scalar;
+# -O3 does NOT auto-vectorize the scalar bitslice chain, so the explicit NEON
+# kernel is required for acceptable phone performance.
 if(NOT MSVC)
   target_compile_options(qunleashed_subghz PRIVATE -O3)
 endif()

@@ -11,6 +11,8 @@ import '../services/notifications/push_service.dart';
 import '../services/rpc/gps/geolocator_gps_provider.dart';
 import '../services/rpc/gps/gps_responder.dart';
 import '../services/rpc/network/network_responder.dart';
+import '../pages/tools/subghz/offload/offload_dispatcher.dart';
+import '../pages/tools/subghz/offload/offload_notification.dart';
 
 /// genuinely unexpected runtime errors (IO, OS permission denials), not a
 /// substitute for correct per-platform configuration.
@@ -37,6 +39,12 @@ void bootstrapAmbientServices() {
   // Answers network requests from custom firmware apps with the phone's
   // internet connection.
   client.attachNetworkResponder();
+
+  // Answers compute-offload requests (PSA / KeeLoq brute-force) the Flipper
+  // pushes over the custom-data channel, running the heavy crypto natively on
+  // the phone and streaming results back automatically.
+  OffloadDispatcher.ensureStarted(client);
+  OffloadNotificationService.instance.start(OffloadDispatcher.instance);
 
   // Battery/storage polling is pointless while nobody can see it; freezing it
   // in the background saves both the phone's and the Flipper's battery.

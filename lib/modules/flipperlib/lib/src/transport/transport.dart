@@ -61,12 +61,22 @@ abstract class Transport {
   static const int bleChunkSize = 512;
 
   final _bytesCtrl = StreamController<List<int>>.broadcast();
+  // Separate channel for the ARF compute-offload custom-data messages (raw
+  // binary BF frames from fe66), kept fully apart from the RPC byte stream.
+  final _customDataCtrl = StreamController<Uint8List>.broadcast();
   final List<TransportPendingWrite> _writeQueue = [];
   bool _writePumpRunning = false;
   TransportLifecycle _lifecycle = TransportLifecycle.active;
   Object? _closeReason;
 
   Stream<List<int>> get bytesStream => _bytesCtrl.stream;
+
+  /// Raw custom-data (offload) messages received from the Flipper (fe66).
+  /// Empty on transports/firmware without the offload channel.
+  Stream<Uint8List> get customDataStream => _customDataCtrl.stream;
+
+  /// Whether this transport exposes the ARF offload channel (fe65/fe66).
+  bool get supportsOffload => false;
 
   bool get isClosed => _lifecycle == TransportLifecycle.closed;
 
@@ -77,6 +87,20 @@ abstract class Transport {
   void addBytes(List<int> bytes) {
     if (!isActive || _bytesCtrl.isClosed) return;
     _bytesCtrl.add(bytes);
+  }
+
+  /// Pushes a received offload message onto [customDataStream].
+  void addCustomData(Uint8List bytes) {
+    if (!isActive || _customDataCtrl.isClosed) return;
+    _customDataCtrl.add(bytes);
+  }
+
+  /// Writes a raw offload message back to the Flipper (fe65). Transports
+  /// without the offload channel throw [UnsupportedError].
+  Future<void> writeCustomData(Uint8List bytes) {
+    return Future.error(
+      UnsupportedError('This transport has no offload channel'),
+    );
   }
 
   bool get supportsCli;
@@ -145,6 +169,9 @@ abstract class Transport {
     if (!_bytesCtrl.isClosed) {
       _bytesCtrl.close();
     }
+    if (!_customDataCtrl.isClosed) {
+      _customDataCtrl.close();
+    }
   }
 
   // Releases platform resources and wakes internal waiters after a fault.
@@ -163,6 +190,9 @@ abstract class Transport {
     _lifecycle = TransportLifecycle.closed;
     if (!_bytesCtrl.isClosed) {
       await _bytesCtrl.close();
+    }
+    if (!_customDataCtrl.isClosed) {
+      await _customDataCtrl.close();
     }
   }
 
