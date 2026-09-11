@@ -118,10 +118,14 @@ static inline uint8_t bs_get_lane(bitslice_t v, uint8_t lane) {
     return (uint8_t)((words[w] >> b) & 1U);
 }
 
-// Return true iff ALL 128 bits of the bitslice are zero. Uses NEON reduction:
-// `vmaxvq_u32(v) == 0` iff every element is 0.
+// Return true iff ALL 128 bits of the bitslice are zero. vmaxvq_u32 (the NEON
+// horizontal-max reduction) is AArch64-only and does not exist on ARMv7
+// (armeabi-v7a), so reduce portably: store the 4 lanes and OR them. Works on
+// both 32-bit and 64-bit ARM.
 static inline bool bs_is_all_zero(bitslice_t v) {
-    return vmaxvq_u32(v) == 0U;
+    uint32_t words[4];
+    vst1q_u32(words, v);
+    return (words[0] | words[1] | words[2] | words[3]) == 0U;
 }
 
 // Layer-0 scalar filter: pack a 48-bit state where only the 20 LAYER0_MASK
