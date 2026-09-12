@@ -7,28 +7,43 @@ import 'package:ffi/ffi.dart';
 
 import 'subghz_native.dart';
 
-/// One captured Fiat V1 rolling code the Hitag2Hell attack cross-validates
+/// One captured Hitag2 rolling code the Hitag2Hell attack cross-validates
 /// against. Two or more captures from the same key sharply cut the candidate
-/// key space.
+/// key space. The active fields depend on [proto]:
+///   * Fiat V1    : uid, button, counter (16-bit), hop.
+///   * Fiat V2    : uid, raw (14-byte frame); hop/uid/IV re-derived natively.
+///   * Renault V1 : uid, button, counter (8-bit), payload42.
 class Hitag2Capture {
   const Hitag2Capture({
     required this.uid,
-    required this.button,
-    required this.counter,
-    required this.hop,
+    this.button = 0,
+    this.counter = 0,
+    this.hop = 0,
+    this.proto = 0,
+    this.raw,
+    this.payload42,
   });
 
-  /// 32-bit tag UID.
+  /// 32-bit tag UID (Renault V1: serial & 0xFFFFFF, from the header).
   final int uid;
 
   /// Button code (0..255).
   final int button;
 
-  /// 16-bit rolling counter at capture time.
+  /// Rolling counter at capture time (16-bit Fiat V1, 8-bit Renault V1).
   final int counter;
 
-  /// 32-bit captured hopping code.
+  /// 32-bit captured hopping code (Fiat V1).
   final int hop;
+
+  /// 0=Fiat V1, 1=Fiat V2, 2=Renault V1.
+  final int proto;
+
+  /// Fiat V2: the 14-byte verbatim frame (bytes 0..13). Null otherwise.
+  final Uint8List? raw;
+
+  /// Renault V1: the low 42 bits of the payload. Null otherwise.
+  final int? payload42;
 }
 
 /// Outcome of a Hitag2Hell recovery: the 6-byte key when [found], else a
@@ -75,12 +90,19 @@ class Hitag2RecoverHandle {
 
 // C signature (qunleashed_subghz_bridge.c):
 //   int qunleashed_hitag2hell_recover(
+//       int32_t proto,
 //       const uint32_t* uids, const uint8_t* btns,
 //       const uint16_t* cnts, const uint32_t* hops,
+//       const uint8_t* raws,        // Fiat V2: capture_count*14 bytes
+//       const uint64_t* payload42s, // Renault V1: capture_count entries
 //       uint32_t capture_count,
 //       uint32_t l0_start, uint32_t l0_end,
 //       uint8_t* out_key, int32_t* found,
 //       uint64_t* progress_out, volatile int32_t* cancel);
+//
+// `proto`: 0=Fiat V1 (uids/btns/cnts/hops), 1=Fiat V2 (raws; uid/hop derived
+// natively), 2=Renault V1 (uids/btns/cnts + payload42s). Unused arrays may be
+// NULL (nullptr); we always pass allocated buffers to keep marshalling simple.
 //
 // Progress is a SHARED MEMORY cell (Pointer<Uint64>) the native code writes,
 // NOT a Dart callback. Dart FFI callbacks may only be called from the isolate
@@ -89,10 +111,13 @@ class Hitag2RecoverHandle {
 // Dart side polls it with a Timer.
 typedef _Hitag2Native =
     Int32 Function(
+      Int32 proto,
       Pointer<Uint32> uids,
       Pointer<Uint8> btns,
       Pointer<Uint16> cnts,
       Pointer<Uint32> hops,
+      Pointer<Uint8> raws,
+      Pointer<Uint64> payload42s,
       Uint32 captureCount,
       Uint32 l0Start,
       Uint32 l0End,
@@ -104,10 +129,13 @@ typedef _Hitag2Native =
 
 typedef _Hitag2Dart =
     int Function(
+      int proto,
       Pointer<Uint32> uids,
       Pointer<Uint8> btns,
       Pointer<Uint16> cnts,
       Pointer<Uint32> hops,
+      Pointer<Uint8> raws,
+      Pointer<Uint64> payload42s,
       int captureCount,
       int l0Start,
       int l0End,
@@ -135,6 +163,7 @@ class NativeHitag2HellRecoverer {
   /// surfaces as a [NativeEngineUnavailable] from [result].
   Hitag2RecoverHandle start({
     required List<Hitag2Capture> captures,
+    int proto = 0,
     int l0Start = 0,
     int l0End = 0,
   }) {
@@ -142,18 +171,29 @@ class NativeHitag2HellRecoverer {
       throw ArgumentError('at least one capture is required');
     }
 
-    // Flatten to the parallel arrays the C entry point takes.
+    // Flatten to the parallel arrays the C entry point takes. `raws` is a
+    // capture_count*14 flat byte array (Fiat V2); `payload42s` is one 64-bit
+    // entry per capture (Renault V1). Unused arrays for a given proto are left
+    // zero-filled and ignored natively.
     final n = captures.length;
     final uids = Uint32List(n);
     final btns = Uint8List(n);
     final cnts = Uint16List(n);
     final hops = Uint32List(n);
+    final raws = Uint8List(n * 14);
+    final payload42s = Uint64List(n);
     for (var i = 0; i < n; i++) {
       final c = captures[i];
       uids[i] = c.uid;
       btns[i] = c.button;
       cnts[i] = c.counter;
       hops[i] = c.hop;
+      final raw = c.raw;
+      if (raw != null) {
+        final take = raw.length < 14 ? raw.length : 14;
+        raws.setRange(i * 14, i * 14 + take, raw);
+      }
+      payload42s[i] = c.payload42 ?? 0;
     }
 
     final cancel = calloc<Int32>();
@@ -173,10 +213,13 @@ class NativeHitag2HellRecoverer {
     });
 
     final payload = _Hitag2Payload(
+      proto: proto,
       uids: uids,
       btns: btns,
       cnts: cnts,
       hops: hops,
+      raws: raws,
+      payload42s: payload42s,
       l0Start: l0Start,
       l0End: l0End,
       cancelAddress: cancel.address,
@@ -223,6 +266,8 @@ class NativeHitag2HellRecoverer {
     final btns = calloc<Uint8>(n);
     final cnts = calloc<Uint16>(n);
     final hops = calloc<Uint32>(n);
+    final raws = calloc<Uint8>(n * 14);
+    final payload42s = calloc<Uint64>(n);
     final outKey = calloc<Uint8>(6);
     final found = calloc<Int32>();
     try {
@@ -230,12 +275,17 @@ class NativeHitag2HellRecoverer {
       btns.asTypedList(n).setAll(0, p.btns);
       cnts.asTypedList(n).setAll(0, p.cnts);
       hops.asTypedList(n).setAll(0, p.hops);
+      raws.asTypedList(n * 14).setAll(0, p.raws);
+      payload42s.asTypedList(n).setAll(0, p.payload42s);
 
       final rc = run(
+        p.proto,
         uids,
         btns,
         cnts,
         hops,
+        raws,
+        payload42s,
         n,
         p.l0Start,
         p.l0End,
@@ -257,6 +307,8 @@ class NativeHitag2HellRecoverer {
       calloc.free(btns);
       calloc.free(cnts);
       calloc.free(hops);
+      calloc.free(raws);
+      calloc.free(payload42s);
       calloc.free(outKey);
       calloc.free(found);
     }
@@ -265,20 +317,26 @@ class NativeHitag2HellRecoverer {
 
 class _Hitag2Payload {
   const _Hitag2Payload({
+    required this.proto,
     required this.uids,
     required this.btns,
     required this.cnts,
     required this.hops,
+    required this.raws,
+    required this.payload42s,
     required this.l0Start,
     required this.l0End,
     required this.cancelAddress,
     required this.progressAddress,
   });
 
+  final int proto;
   final Uint32List uids;
   final Uint8List btns;
   final Uint16List cnts;
   final Uint32List hops;
+  final Uint8List raws;
+  final Uint64List payload42s;
   final int l0Start;
   final int l0End;
   final int cancelAddress;

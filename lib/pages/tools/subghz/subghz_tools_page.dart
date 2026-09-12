@@ -1,24 +1,90 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'hitag2hell_recoverer.dart';
 import 'keeloq_recoverer.dart';
+import 'offload/bf_protocol.dart';
+import 'offload/offload_dispatcher.dart';
 import 'psa_recoverer.dart';
 
 /// A minimal tools page exercising the three `qunleashed_subghz` recoverers:
 /// KeeLoq decrypt (single-shot), the PSA TEA bruteforce (progress + cancel),
 /// and the Hitag2Hell Fiat V1 attack (progress + cancel + ETA).
 ///
+/// It also serves as the compute-offload UI: when the Flipper pushes a PSA /
+/// KeeLoq / Hitag2 offload request, [OffloadDispatcher] navigates here with the
+/// matching tab pre-selected and the parsed request in [pending]. The user then
+/// presses Start to run the native compute (progress mirrored from the
+/// dispatcher's status stream, back to the Flipper).
+///
 /// It deliberately uses plain Material widgets rather than the app's themed
 /// components so it stays self-contained; wire it into the tools router the
 /// same way the MIFARE `RecoverPage` is (push it as a route).
-class SubghzToolsPage extends StatelessWidget {
-  const SubghzToolsPage({super.key});
+class SubghzToolsPage extends StatefulWidget {
+  const SubghzToolsPage({
+    super.key,
+    this.initialTab = 0,
+    this.pending,
+    this.dispatcherPushed = false,
+  });
+
+  /// Initial tab index (0=KeeLoq, 1=PSA, 2=Hitag2Hell).
+  final int initialTab;
+
+  /// The offload request to pre-load, when opened by the dispatcher.
+  final OffloadPendingJob? pending;
+
+  /// True when [OffloadDispatcher] pushed this page (it pre-counts the page, so
+  /// this instance must not self-register in [OffloadDispatcher.notifyPageOpened]).
+  final bool dispatcherPushed;
+
+  @override
+  State<SubghzToolsPage> createState() => _SubghzToolsPageState();
+}
+
+class _SubghzToolsPageState extends State<SubghzToolsPage> {
+  OffloadPendingJob? _pending;
+  StreamSubscription<OffloadPendingJob>? _pendingSub;
+
+  @override
+  void initState() {
+    super.initState();
+    _pending = widget.pending;
+    // Dispatcher-pushed pages are pre-counted; manually-opened pages register
+    // themselves so a request arriving now updates this page in place.
+    if (!widget.dispatcherPushed) {
+      OffloadDispatcher.notifyPageOpened();
+    }
+    // A newer request may arrive while this page is on top; pick it up.
+    if (OffloadDispatcher.hasInstance) {
+      _pendingSub = OffloadDispatcher.instance.pendingJobs.listen((job) {
+        if (!mounted) return;
+        setState(() => _pending = job);
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _pendingSub?.cancel();
+    // Let the dispatcher know it can push a fresh page next time.
+    OffloadDispatcher.notifyPageClosed();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
+    final psaJob = _pending?.kind == OffloadJobKind.psa ? _pending!.psa : null;
+    final keeloqJob =
+        _pending?.kind == OffloadJobKind.keeloq ? _pending!.keeloq : null;
+    final hitagJob =
+        _pending?.kind == OffloadJobKind.hitag ? _pending!.hitag : null;
+
     return DefaultTabController(
       length: 3,
+      initialIndex: widget.initialTab.clamp(0, 2),
       child: Scaffold(
         appBar: AppBar(
           title: const Text('Sub-GHz Tools'),
@@ -30,14 +96,56 @@ class SubghzToolsPage extends StatelessWidget {
             ],
           ),
         ),
-        body: const TabBarView(
+        body: TabBarView(
           children: [
-            _KeeloqTab(),
-            _PsaTab(),
-            _Hitag2Tab(),
+            _KeeloqTab(offload: keeloqJob),
+            _PsaTab(offload: psaJob),
+            _Hitag2Tab(offload: hitagJob),
           ],
         ),
       ),
+    );
+  }
+}
+
+/// A live progress bar bound to [OffloadDispatcher.status], shown only while a
+/// job of [kind] is running (or just finished). Mirrors the manual bars below.
+class _OffloadProgress extends StatelessWidget {
+  const _OffloadProgress({required this.kind});
+
+  final OffloadJobKind kind;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!OffloadDispatcher.hasInstance) return const SizedBox.shrink();
+    return StreamBuilder<OffloadStatus>(
+      stream: OffloadDispatcher.instance.status,
+      builder: (context, snap) {
+        final s = snap.data;
+        if (s == null || s.kind != kind) return const SizedBox.shrink();
+        if (s.running) {
+          final value = s.percent <= 0 ? null : s.percent / 100.0;
+          final kps = s.keysPerSec > 0 ? '  ${s.keysPerSec}/s' : '';
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                LinearProgressIndicator(value: value),
+                const SizedBox(height: 8),
+                Text('${s.percent}% — ${s.keysTested} keys$kps'),
+              ],
+            ),
+          );
+        }
+        // Finished: show the outcome message (if any).
+        final msg = s.lastMessage;
+        if (msg == null) return const SizedBox.shrink();
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: SelectableText(msg),
+        );
+      },
     );
   }
 }
@@ -69,7 +177,9 @@ String _hex(int v, int width) =>
 // KeeLoq
 // ---------------------------------------------------------------------------
 class _KeeloqTab extends StatefulWidget {
-  const _KeeloqTab();
+  const _KeeloqTab({this.offload});
+
+  final KeeloqBfRequest? offload;
 
   @override
   State<_KeeloqTab> createState() => _KeeloqTabState();
@@ -85,6 +195,44 @@ class _KeeloqTabState extends State<_KeeloqTab> {
     _hop.dispose();
     _key.dispose();
     super.dispose();
+  }
+
+  void _runOffload() {
+    final req = widget.offload;
+    if (req == null || !OffloadDispatcher.hasInstance) return;
+    OffloadDispatcher.instance.runKeeloq(req);
+  }
+
+  Widget _offloadCard(KeeloqBfRequest req) {
+    return Card(
+      margin: const EdgeInsets.only(bottom: 16),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Text(
+              'Offload request from Flipper',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            SelectableText(
+              'learnType=${req.learningType}\n'
+              'fix=0x${_hex(req.fix, 8)}\n'
+              'hop1=0x${_hex(req.hop1, 8)}\n'
+              'hop2=0x${_hex(req.hop2, 8)}\n'
+              'serial=0x${_hex(req.serial, 8)}',
+            ),
+            const SizedBox(height: 12),
+            const _OffloadProgress(kind: OffloadJobKind.keeloq),
+            ElevatedButton(
+              onPressed: _runOffload,
+              child: const Text('Start'),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   void _run() {
@@ -104,11 +252,13 @@ class _KeeloqTabState extends State<_KeeloqTab> {
 
   @override
   Widget build(BuildContext context) {
+    final offload = widget.offload;
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          if (offload != null) _offloadCard(offload),
           TextField(
             controller: _hop,
             decoration: const InputDecoration(
@@ -138,7 +288,9 @@ class _KeeloqTabState extends State<_KeeloqTab> {
 // PSA
 // ---------------------------------------------------------------------------
 class _PsaTab extends StatefulWidget {
-  const _PsaTab();
+  const _PsaTab({this.offload});
+
+  final PsaBfRequest? offload;
 
   @override
   State<_PsaTab> createState() => _PsaTabState();
@@ -160,6 +312,41 @@ class _PsaTabState extends State<_PsaTab> {
     _key1.dispose();
     _key2.dispose();
     super.dispose();
+  }
+
+  void _runOffload() {
+    final req = widget.offload;
+    if (req == null || !OffloadDispatcher.hasInstance) return;
+    OffloadDispatcher.instance.runPsa(req);
+  }
+
+  Widget _offloadCard(PsaBfRequest req) {
+    return Card(
+      margin: const EdgeInsets.only(bottom: 16),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Text(
+              'Offload request from Flipper',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            SelectableText(
+              'Offload: w0=${_hex(req.w0, 8)} w1=${_hex(req.w1, 8)}'
+              '${req.bfType != 0 ? '  (BF${req.bfType})' : ''}',
+            ),
+            const SizedBox(height: 12),
+            const _OffloadProgress(kind: OffloadJobKind.psa),
+            ElevatedButton(
+              onPressed: _runOffload,
+              child: const Text('Start'),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _run() async {
@@ -214,11 +401,13 @@ class _PsaTabState extends State<_PsaTab> {
 
   @override
   Widget build(BuildContext context) {
+    final offload = widget.offload;
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          if (offload != null) _offloadCard(offload),
           TextField(
             controller: _key1,
             decoration: const InputDecoration(
@@ -271,7 +460,9 @@ class _PsaTabState extends State<_PsaTab> {
 // Hitag2Hell
 // ---------------------------------------------------------------------------
 class _Hitag2Tab extends StatefulWidget {
-  const _Hitag2Tab();
+  const _Hitag2Tab({this.offload});
+
+  final HitagBfRequest? offload;
 
   @override
   State<_Hitag2Tab> createState() => _Hitag2TabState();
@@ -300,6 +491,49 @@ class _Hitag2TabState extends State<_Hitag2Tab> {
     _cnt.dispose();
     _hop.dispose();
     super.dispose();
+  }
+
+  void _runOffload() {
+    final req = widget.offload;
+    if (req == null || !OffloadDispatcher.hasInstance) return;
+    OffloadDispatcher.instance.runHitag(req);
+  }
+
+  static String _protoName(int proto) => switch (proto) {
+    kHitagProtoFiatV1 => 'Fiat V1',
+    kHitagProtoFiatV2 => 'Fiat V2',
+    kHitagProtoRenaultV1 => 'Renault V1',
+    _ => 'proto $proto',
+  };
+
+  Widget _offloadCard(HitagBfRequest req) {
+    return Card(
+      margin: const EdgeInsets.only(bottom: 16),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Text(
+              'Offload request from Flipper',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            SelectableText(
+              'proto=${_protoName(req.proto)}\n'
+              'uid=0x${_hex(req.uid, 8)}\n'
+              '${req.captures.length} capture(s)',
+            ),
+            const SizedBox(height: 12),
+            const _OffloadProgress(kind: OffloadJobKind.hitag),
+            ElevatedButton(
+              onPressed: _runOffload,
+              child: const Text('Start'),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   void _addCapture() {
@@ -379,11 +613,13 @@ class _Hitag2TabState extends State<_Hitag2Tab> {
 
   @override
   Widget build(BuildContext context) {
+    final offload = widget.offload;
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          if (offload != null) _offloadCard(offload),
           TextField(
             controller: _uid,
             decoration: const InputDecoration(labelText: 'UID (hex, 32-bit)'),

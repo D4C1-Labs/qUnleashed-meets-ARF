@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../services/localization/controller.dart';
 import '../services/localization/l10n.dart';
 import '../theme/theme.dart';
+import 'navigation_key.dart';
 import 'shell.dart';
 
 class QUnleashedApp extends StatelessWidget {
@@ -16,6 +17,7 @@ class QUnleashedApp extends StatelessWidget {
       animation: Listenable.merge([controller, locales]),
       builder: (context, _) {
         return MaterialApp(
+          navigatorKey: appNavigatorKey,
           onGenerateTitle: (context) => context.l10n.appTitle,
           debugShowCheckedModeBanner: false,
           locale: locales.locale,

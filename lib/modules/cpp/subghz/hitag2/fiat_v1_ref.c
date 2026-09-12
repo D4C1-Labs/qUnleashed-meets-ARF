@@ -1,6 +1,8 @@
 // Reference implementation of the Fiat V1 Hitag2 variant, extracted from
 // standalone_test.c so multiple runners can link against it.
 
+#include "fiat_v1_ref.h"
+
 #include <stdint.h>
 #include <stdbool.h>
 

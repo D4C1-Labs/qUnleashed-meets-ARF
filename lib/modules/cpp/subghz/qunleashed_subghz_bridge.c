@@ -17,6 +17,7 @@
 #include "keeloq/keeloq.h"
 #include "keeloq/keeloq_bruteforce.h"
 #include "hitag2/hitag2_threaded.h"
+#include "hitag2/fiat_v2_ref.h"
 
 #if defined(_WIN32)
 #define QUNLEASHED_EXPORT __declspec(dllexport)
@@ -222,15 +223,29 @@ static bool hitag2_bridge_progress(uint8_t pct, uint64_t slots_done, void* raw) 
     return true;
 }
 
-// Recover a Fiat V1 48-bit key from one or more captures. The parallel arrays
-// uids/btns/cnts/hops each hold `capture_count` entries. Returns 0 on success
-// (out_key filled, *found=1), -2 on bad args, -10 when no cross-validated key
-// was found (*found=0). progress_out: optional shared packed-progress cell.
+// Recover a Fiat V1 / Fiat V2 / Renault V1 48-bit key from one or more captures.
+//
+// `proto` selects the wire/normalization:
+//   0 = Fiat V1    : uses uids/btns/cnts/hops (raws/payload42 ignored/NULL).
+//   1 = Fiat V2    : uses `raws` (14 bytes per capture); uid/hop are re-derived
+//                    from each raw frame on the native side (uids/btns/cnts/hops
+//                    may be NULL). The 4 IV combos are searched in validation.
+//   2 = Renault V1 : uses uids (uid = serial & 0xFFFFFF, shared header value),
+//                    `payload42s`, `btns`, `cnts` (counter is 8-bit here). The 3
+//                    hop slices x 4 IV combos are searched.
+//
+// The parallel arrays each hold `capture_count` entries (raws holds
+// capture_count*14 bytes). Returns 0 on success (out_key filled, *found=1), -2
+// on bad args, -10 when no cross-validated key was found (*found=0).
+// progress_out: optional shared packed-progress cell. epoch is 0 for all.
 QUNLEASHED_EXPORT int qunleashed_hitag2hell_recover(
+    int32_t proto,
     const uint32_t* uids,
     const uint8_t* btns,
     const uint16_t* cnts,
     const uint32_t* hops,
+    const uint8_t* raws,        // Fiat V2: capture_count*14 bytes, else NULL
+    const uint64_t* payload42s, // Renault V1: capture_count entries, else NULL
     uint32_t capture_count,
     uint32_t l0_start,
     uint32_t l0_end,
@@ -239,7 +254,16 @@ QUNLEASHED_EXPORT int qunleashed_hitag2hell_recover(
     uint64_t* progress_out,
     volatile int32_t* cancel) {
     if(found) *found = 0;
-    if(!uids || !btns || !cnts || !hops || !out_key || capture_count == 0) {
+    if(!out_key || capture_count == 0) return -2;
+
+    // Per-proto required inputs.
+    if(proto == (int32_t)HITAG2_PROTO_FIAT_V1) {
+        if(!uids || !btns || !cnts || !hops) return -2;
+    } else if(proto == (int32_t)HITAG2_PROTO_FIAT_V2) {
+        if(!raws) return -2;
+    } else if(proto == (int32_t)HITAG2_PROTO_RENAULT_V1) {
+        if(!uids || !btns || !cnts || !payload42s) return -2;
+    } else {
         return -2;
     }
 
@@ -247,10 +271,23 @@ QUNLEASHED_EXPORT int qunleashed_hitag2hell_recover(
         (Hitag2Capture*)calloc((size_t)capture_count, sizeof(Hitag2Capture));
     if(!caps) return -2;
     for(uint32_t i = 0; i < capture_count; i++) {
-        caps[i].uid = uids[i];
-        caps[i].button = btns[i];
-        caps[i].counter = cnts[i];
-        caps[i].hop = hops[i];
+        caps[i].proto = (uint8_t)proto;
+        if(proto == (int32_t)HITAG2_PROTO_FIAT_V1) {
+            caps[i].uid = uids[i];
+            caps[i].button = btns[i];
+            caps[i].counter = cnts[i];
+            caps[i].hop = hops[i];
+        } else if(proto == (int32_t)HITAG2_PROTO_FIAT_V2) {
+            const uint8_t* r = &raws[(size_t)i * FIAT_V2_WIRE_BYTES];
+            memcpy(caps[i].raw, r, FIAT_V2_WIRE_BYTES);
+            caps[i].uid = fiat_v2_uid(r);
+            caps[i].hop = fiat_v2_hop(r);
+        } else { // Renault V1
+            caps[i].uid = uids[i];
+            caps[i].button = btns[i];
+            caps[i].counter = cnts[i]; // 8-bit counter carried in the 16-bit field
+            caps[i].payload42 = payload42s[i];
+        }
     }
 
     Hitag2BridgeCtx bctx = {progress_out, cancel};

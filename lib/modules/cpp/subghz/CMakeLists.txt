@@ -16,6 +16,8 @@ add_library(qunleashed_subghz SHARED
   hitag2/subghz_hitag2_hell_optb.c
   hitag2/subghz_hitag2_hell_neon.c
   hitag2/fiat_v1_ref.c
+  hitag2/fiat_v2_ref.c
+  hitag2/renault_v1_ref.c
   hitag2/hitag2_threaded.c
 )
 

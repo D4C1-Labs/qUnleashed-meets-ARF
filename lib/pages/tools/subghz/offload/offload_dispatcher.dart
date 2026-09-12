@@ -5,8 +5,11 @@ import 'dart:typed_data';
 // `DateTime` message that shadows dart:core's DateTime. Hide it so DateTime.now()
 // resolves to the core class.
 import 'package:flipperlib/flipperlib.dart' hide DateTime;
+import 'package:flutter/material.dart';
 
+import '../../../../app/navigation_key.dart';
 import '../hitag2hell_recoverer.dart';
+import '../subghz_tools_page.dart';
 import 'bf_protocol.dart';
 import 'keeloq_offload_recoverer.dart';
 import 'psa_offload_recoverer.dart';
@@ -21,6 +24,7 @@ class OffloadStatus {
     required this.running,
     required this.percent,
     required this.keysTested,
+    this.keysPerSec = 0,
     this.lastMessage,
   });
 
@@ -29,13 +33,34 @@ class OffloadStatus {
       running = false,
       percent = 0,
       keysTested = 0,
+      keysPerSec = 0,
       lastMessage = null;
 
   final OffloadJobKind kind;
   final bool running;
   final int percent;
   final int keysTested;
+
+  /// Keys/sec computed on the last progress tick (0 when unknown).
+  final int keysPerSec;
   final String? lastMessage;
+}
+
+/// A parsed offload request the Flipper pushed, waiting for the user to press
+/// Start in the Sub-GHz Crypto page. Exactly one of [psa]/[keeloq]/[hitag] is
+/// non-null, matching [kind].
+class OffloadPendingJob {
+  const OffloadPendingJob({
+    required this.kind,
+    this.psa,
+    this.keeloq,
+    this.hitag,
+  });
+
+  final OffloadJobKind kind;
+  final PsaBfRequest? psa;
+  final KeeloqBfRequest? keeloq;
+  final HitagBfRequest? hitag;
 }
 
 /// Listens for compute-offload requests the Flipper pushes over the custom-data
@@ -71,6 +96,18 @@ class OffloadDispatcher {
 
   /// Live status for a progress UI / notification.
   Stream<OffloadStatus> get status => _statusCtrl.stream;
+
+  final _pendingCtrl = StreamController<OffloadPendingJob>.broadcast();
+
+  /// Emits each time the Flipper pushes a new offload request. The Sub-GHz
+  /// Crypto page listens so it can pre-load the data into the right tab.
+  Stream<OffloadPendingJob> get pendingJobs => _pendingCtrl.stream;
+
+  OffloadPendingJob? _lastPending;
+
+  /// The most recent pending job, so a page opened slightly after the request
+  /// arrived can still read it (the stream is broadcast + non-replaying).
+  OffloadPendingJob? get lastPending => _lastPending;
 
   OffloadJobKind _jobKind = OffloadJobKind.none;
   final Stopwatch _jobClock = Stopwatch();
@@ -122,28 +159,102 @@ class OffloadDispatcher {
         BfProtocol.isKeeloqCancel(data) ||
         BfProtocol.isHitagCancel(data)) {
       _cancelActiveJob();
+      _lastPending = null;
       _emit(running: false, message: 'Cancelled by Flipper');
       return;
     }
     if (BfProtocol.isPsa(data)) {
       final req = BfProtocol.parsePsaRequest(data);
-      if (req != null) _startPsa(req);
+      if (req != null) {
+        _publishPending(
+          OffloadPendingJob(kind: OffloadJobKind.psa, psa: req),
+        );
+      }
       return;
     }
     if (BfProtocol.isKeeloq(data)) {
       final req = BfProtocol.parseKeeloqRequest(data);
-      if (req != null) _startKeeloq(req);
+      if (req != null) {
+        _publishPending(
+          OffloadPendingJob(kind: OffloadJobKind.keeloq, keeloq: req),
+        );
+      }
       return;
     }
     if (BfProtocol.isHitag(data)) {
-      final req = BfProtocol.parseHitagRequest(data);
-      if (req != null) _startHitag(req);
+      // The firmware now always sends the combo/slice-aware 0x24 request; the
+      // legacy 0x20 parser is kept for backward compatibility.
+      final req = BfProtocol.isHitagV2(data)
+          ? BfProtocol.parseHitagRequestV2(data)
+          : BfProtocol.parseHitagRequest(data);
+      if (req != null) {
+        _publishPending(
+          OffloadPendingJob(kind: OffloadJobKind.hitag, hitag: req),
+        );
+      }
       return;
     }
   }
 
+  /// Tab indices in [SubghzToolsPage] (order: KeeLoq, PSA, Hitag2Hell).
+  static const int _tabKeeloq = 0;
+  static const int _tabPsa = 1;
+  static const int _tabHitag = 2;
+
+  /// Number of live (or in-flight) [SubghzToolsPage] instances. While > 0 a
+  /// fresh request updates the open page via [pendingJobs] instead of pushing a
+  /// new one. Incremented at push time (before the page mounts) to close the
+  /// mount-gap race, and by manually-opened pages in their initState.
+  static int _openPages = 0;
+  static bool get _pageOpen => _openPages > 0;
+
+  /// Called by a manually-opened [SubghzToolsPage] when it mounts. Pages the
+  /// dispatcher pushed are already counted (see [_publishPending]).
+  static void notifyPageOpened() => _openPages++;
+
+  /// Called by [SubghzToolsPage] when it unmounts.
+  static void notifyPageClosed() {
+    if (_openPages > 0) _openPages--;
+  }
+
+  /// Stores the new pending job, notifies any open page, and navigates to the
+  /// Sub-GHz Crypto page on the correct tab (unless one is already open — then
+  /// the [pendingJobs] emit above updates it in place).
+  void _publishPending(OffloadPendingJob job) {
+    _lastPending = job;
+    if (!_pendingCtrl.isClosed) _pendingCtrl.add(job);
+
+    if (_pageOpen) return; // Existing page picks it up via pendingJobs.
+
+    final nav = appNavigatorKey.currentState;
+    if (nav == null) return;
+
+    final tab = switch (job.kind) {
+      OffloadJobKind.psa => _tabPsa,
+      OffloadJobKind.keeloq => _tabKeeloq,
+      OffloadJobKind.hitag => _tabHitag,
+      OffloadJobKind.none => _tabKeeloq,
+    };
+    // Count this page now (before it mounts) so a second request arriving in
+    // the mount gap updates it via pendingJobs instead of pushing again. The
+    // pushed page must NOT call notifyPageOpened() (it is pre-counted).
+    _openPages++;
+    nav.push(
+      MaterialPageRoute<void>(
+        builder: (_) => SubghzToolsPage(
+          initialTab: tab,
+          pending: job,
+          dispatcherPushed: true,
+        ),
+      ),
+    );
+  }
+
   // ---- PSA ----
-  void _startPsa(PsaBfRequest req) {
+  /// Runs the PSA brute-force for [req]. Called by the Sub-GHz page when the
+  /// user presses Start; streams progress + result back to the Flipper exactly
+  /// as the old auto-start path did.
+  void runPsa(PsaBfRequest req) {
     _cancelActiveJob();
     _jobKind = OffloadJobKind.psa;
     _jobClock
@@ -183,7 +294,8 @@ class OffloadDispatcher {
   }
 
   // ---- KeeLoq ----
-  void _startKeeloq(KeeloqBfRequest req) {
+  /// Runs the KeeLoq brute-force for [req] (user-Start; wiring unchanged).
+  void runKeeloq(KeeloqBfRequest req) {
     _cancelActiveJob();
     _jobKind = OffloadJobKind.keeloq;
     _jobClock
@@ -238,7 +350,8 @@ class OffloadDispatcher {
   }
 
   // ---- Hitag2 / Fiat V1 ----
-  void _startHitag(HitagBfRequest req) {
+  /// Runs the Hitag2Hell brute-force for [req] (user-Start; wiring unchanged).
+  void runHitag(HitagBfRequest req) {
     _cancelActiveJob();
     if (req.captures.isEmpty) {
       _writeCustom(BfProtocol.encodeHitagResult(found: false, key: const []));
@@ -258,10 +371,14 @@ class OffloadDispatcher {
           button: c.button,
           counter: c.counter,
           hop: c.hop,
+          proto: req.proto,
+          raw: c.raw,
+          payload42: c.payload42,
         ),
     ];
 
     final handle = NativeHitag2HellRecoverer().start(
+      proto: req.proto,
       captures: captures,
       l0Start: req.l0Start,
       l0End: req.l0End,
@@ -293,7 +410,17 @@ class OffloadDispatcher {
 
   void _sendHitagProgress(int percent, int slotsDone) {
     _writeCustom(BfProtocol.encodeHitagProgress(percent, slotsDone));
-    _emit(running: true, percent: percent, keys: slotsDone);
+    // Compute a rough slots/sec for the UI (same model as _sendProgress).
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final dt = now - _lastKeysAt;
+    var kps = 0;
+    if (dt > 0) {
+      kps = ((slotsDone - _lastKeys) * 1000 ~/ dt);
+      if (kps < 0) kps = 0;
+    }
+    _lastKeys = slotsDone;
+    _lastKeysAt = now;
+    _emit(running: true, percent: percent, keys: slotsDone, keysPerSec: kps);
   }
 
   // ---- Progress throttling (~every 500 ms, like the reference) ----
@@ -322,7 +449,7 @@ class OffloadDispatcher {
           ? BfProtocol.encodeKeeloqProgress(keysTested, kps)
           : BfProtocol.encodePsaProgress(keysTested, kps),
     );
-    _emit(running: true, percent: percent, keys: keysTested);
+    _emit(running: true, percent: percent, keys: keysTested, keysPerSec: kps);
   }
 
   void _writeCustom(Uint8List bytes) {
@@ -360,26 +487,32 @@ class OffloadDispatcher {
     _psaHandle = null;
     _keeloqHandle = null;
     _hitagHandle = null;
+    // Emit the completion with the finished kind so per-tab UIs can show the
+    // outcome, then clear the kind for the idle state.
+    final finishedKind = _jobKind;
     _jobKind = OffloadJobKind.none;
     _jobClock.stop();
     _progressThrottle?.cancel();
     _progressThrottle = null;
-    _emit(running: false, message: message);
+    _emit(running: false, message: message, kind: finishedKind);
   }
 
   void _emit({
     required bool running,
     int percent = 0,
     int keys = 0,
+    int keysPerSec = 0,
     String? message,
+    OffloadJobKind? kind,
   }) {
     if (_statusCtrl.isClosed) return;
     _statusCtrl.add(
       OffloadStatus(
-        kind: _jobKind,
+        kind: kind ?? _jobKind,
         running: running,
         percent: percent,
         keysTested: keys,
+        keysPerSec: keysPerSec,
         lastMessage: message,
       ),
     );
@@ -393,5 +526,6 @@ class OffloadDispatcher {
     _customSub = null;
     _attached = null;
     if (!_statusCtrl.isClosed) await _statusCtrl.close();
+    if (!_pendingCtrl.isClosed) await _pendingCtrl.close();
   }
 }

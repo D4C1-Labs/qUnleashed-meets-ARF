@@ -20,4 +20,6 @@
 #include "../hitag2/subghz_hitag2_hell_optb.c"
 #include "../hitag2/subghz_hitag2_hell_neon.c"
 #include "../hitag2/fiat_v1_ref.c"
+#include "../hitag2/fiat_v2_ref.c"
+#include "../hitag2/renault_v1_ref.c"
 #include "../hitag2/hitag2_threaded.c"

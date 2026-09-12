@@ -23,10 +23,28 @@ const int kKlMsgBfResult = 0x12; // phone -> Flipper
 const int kKlMsgBfCancel = 0x13; // Flipper -> phone
 
 // ---- Hitag2 / Fiat V1 (Hitag2Hell) message types ----
-const int kHtMsgBfRequest = 0x20; // Flipper -> phone
+const int kHtMsgBfRequest = 0x20; // Flipper -> phone (legacy Fiat V1 only)
 const int kHtMsgBfProgress = 0x21; // phone -> Flipper
 const int kHtMsgBfResult = 0x22; // phone -> Flipper
 const int kHtMsgBfCancel = 0x23; // Flipper -> phone
+// Combo/slice-aware request (proto: 0=Fiat V1, 1=Fiat V2, 2=Renault V1). The
+// firmware now always sends this opcode instead of 0x20.
+const int kHtMsgBfRequestV2 = 0x24; // Flipper -> phone
+
+// ---- Hitag2 offload protocol ids (wire `proto` byte + native `proto` arg) ----
+const int kHitagProtoFiatV1 = 0;
+const int kHitagProtoFiatV2 = 1;
+const int kHitagProtoRenaultV1 = 2;
+
+/// On-wire capture size (bytes) for each proto in the 0x24 layout.
+const int kHitagCaptureBytesFiatV1 = 7; // btn(1)+cnt(2 LE)+hop(4 LE)
+const int kHitagCaptureBytesFiatV2 = 14; // raw[14] verbatim frame
+const int kHitagCaptureBytesRenaultV1 = 8; // payload42(6 LE)+button(1)+counter(1)
+
+/// Per-proto capture caps enforced on the wire.
+const int kHitagMaxCapturesFiatV1 = 7;
+const int kHitagMaxCapturesFiatV2 = 3;
+const int kHitagMaxCapturesRenaultV1 = 6;
 
 /// A PSA brute-force request from the Flipper: `[0x01][bf_type][w0:4][w1:4]`.
 class PsaBfRequest {
@@ -57,20 +75,32 @@ class KeeloqBfRequest {
   final int serial;
 }
 
-/// One captured Hitag2/Fiat V1 frame: `{btn:1, cnt:2, hop:4}` (7 bytes on wire).
+/// One captured Hitag2 frame. The active fields depend on the request `proto`:
+///   * Fiat V1    : `button`, `counter` (16-bit), `hop`.
+///   * Fiat V2    : `raw` (14-byte verbatim frame); uid/hop/counter/IV are
+///                  re-derived natively from `raw`.
+///   * Renault V1 : `payload42` (low 42 bits), `button`, `counter` (8-bit).
 class HitagCapture {
   const HitagCapture({
-    required this.button,
-    required this.counter,
-    required this.hop,
+    this.button = 0,
+    this.counter = 0,
+    this.hop = 0,
+    this.raw,
+    this.payload42,
   });
   final int button;
   final int counter;
   final int hop;
+
+  /// Fiat V2: the 14-byte verbatim frame (bytes 0..13). Null otherwise.
+  final Uint8List? raw;
+
+  /// Renault V1: the low 42 bits of the payload. Null otherwise.
+  final int? payload42;
 }
 
-/// A Hitag2Hell/Fiat V1 brute-force request:
-/// `[0x20][uid:4][l0_start:4][l0_end:4][count:1][captures: count*{btn:1,cnt:2,hop:4}]`.
+/// A Hitag2Hell brute-force request. Legacy (0x20) requests are Fiat V1 only;
+/// the combo/slice-aware (0x24) request carries an explicit [proto].
 /// uid is shared by all captures; l0_start/l0_end 0 => full 2^20 sweep.
 class HitagBfRequest {
   const HitagBfRequest({
@@ -78,12 +108,16 @@ class HitagBfRequest {
     required this.l0Start,
     required this.l0End,
     required this.captures,
+    this.proto = kHitagProtoFiatV1,
   });
 
   final int uid;
   final int l0Start;
   final int l0End;
   final List<HitagCapture> captures;
+
+  /// 0=Fiat V1, 1=Fiat V2, 2=Renault V1.
+  final int proto;
 }
 
 /// Parses/encodes the offload binary protocol. All multi-byte fields are
@@ -223,12 +257,18 @@ class BfProtocol {
 
   // ---- Hitag2 / Fiat V1 ----
 
-  /// True if [data] is a Hitag2 offload message (type 0x20..0x23).
+  /// True if [data] is a Hitag2 offload message (type 0x20..0x24).
   static bool isHitag(Uint8List data) =>
-      data.isNotEmpty && data[0] >= kHtMsgBfRequest && data[0] <= kHtMsgBfCancel;
+      data.isNotEmpty &&
+      data[0] >= kHtMsgBfRequest &&
+      data[0] <= kHtMsgBfRequestV2;
 
   static bool isHitagCancel(Uint8List data) =>
       data.isNotEmpty && data[0] == kHtMsgBfCancel;
+
+  /// True if [data] is the combo/slice-aware Hitag2 request (0x24).
+  static bool isHitagV2(Uint8List data) =>
+      data.isNotEmpty && data[0] == kHtMsgBfRequestV2;
 
   /// Parses the Hitag2 request (variable length, up to 7 captures). Header is
   /// 14 bytes; each capture adds 7. Returns null if malformed.
@@ -254,6 +294,88 @@ class BfProtocol {
       l0Start: l0Start,
       l0End: l0End,
       captures: caps,
+    );
+  }
+
+  /// Parses the combo/slice-aware Hitag2 request (0x24):
+  ///   `[0x24][proto:1][uid:4][l0_start:4][l0_end:4][count:1][captures...]`
+  /// Header is 15 bytes; each capture's size depends on `proto`:
+  ///   proto 0 (Fiat V1)    : btn(1) + cnt(2 LE) + hop(4 LE)               = 7
+  ///   proto 1 (Fiat V2)    : raw[14]                                       = 14
+  ///   proto 2 (Renault V1) : payload42(6 LE) + button(1) + counter(1)      = 8
+  /// Returns null if malformed (bad opcode, unknown proto, over-cap, or short).
+  static HitagBfRequest? parseHitagRequestV2(Uint8List data) {
+    if (data.length < 15 || data[0] != kHtMsgBfRequestV2) return null;
+    final proto = data[1];
+    final int capBytes;
+    final int maxCaps;
+    switch (proto) {
+      case kHitagProtoFiatV1:
+        capBytes = kHitagCaptureBytesFiatV1;
+        maxCaps = kHitagMaxCapturesFiatV1;
+        break;
+      case kHitagProtoFiatV2:
+        capBytes = kHitagCaptureBytesFiatV2;
+        maxCaps = kHitagMaxCapturesFiatV2;
+        break;
+      case kHitagProtoRenaultV1:
+        capBytes = kHitagCaptureBytesRenaultV1;
+        maxCaps = kHitagMaxCapturesRenaultV1;
+        break;
+      default:
+        return null;
+    }
+    final v = ByteData.sublistView(data);
+    final uid = v.getUint32(2, Endian.little);
+    final l0Start = v.getUint32(6, Endian.little);
+    final l0End = v.getUint32(10, Endian.little);
+    final count = data[14];
+    if (count > maxCaps) return null;
+    if (data.length < 15 + count * capBytes) return null;
+
+    final caps = <HitagCapture>[];
+    var off = 15;
+    for (var i = 0; i < count; i++) {
+      switch (proto) {
+        case kHitagProtoFiatV1:
+          final btn = data[off];
+          final cnt = v.getUint16(off + 1, Endian.little);
+          final hop = v.getUint32(off + 3, Endian.little);
+          caps.add(HitagCapture(button: btn, counter: cnt, hop: hop));
+          break;
+        case kHitagProtoFiatV2:
+          final raw = Uint8List.fromList(
+            data.sublist(off, off + kHitagCaptureBytesFiatV2),
+          );
+          caps.add(HitagCapture(raw: raw));
+          break;
+        case kHitagProtoRenaultV1:
+          // payload42 = low 42 bits, 6 bytes little-endian:
+          //   byte[b] = (payload42 >> (8*b)) & 0xFF; top 6 bits of byte[5] = 0.
+          var payload42 = 0;
+          for (var b = 0; b < 6; b++) {
+            payload42 |= data[off + b] << (8 * b);
+          }
+          payload42 &= 0x3FFFFFFFFFF; // mask to 42 bits (defensive)
+          final button = data[off + 6];
+          final counter = data[off + 7];
+          caps.add(
+            HitagCapture(
+              button: button,
+              counter: counter,
+              payload42: payload42,
+            ),
+          );
+          break;
+      }
+      off += capBytes;
+    }
+    return HitagBfRequest(
+      uid: uid,
+      l0Start: l0Start,
+      l0End: l0End,
+      captures: caps,
+      proto: proto,
     );
   }
 

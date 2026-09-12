@@ -19,6 +19,9 @@
 
 #include "subghz_hitag2_core.h"
 #include "subghz_hitag2_hell.h"
+#include "fiat_v1_ref.h"
+#include "fiat_v2_ref.h"
+#include "renault_v1_ref.h"
 #include "../subghz_util.h"
 
 // ---------------------------------------------------------------------------
@@ -62,22 +65,105 @@ typedef struct {
 // Validate a state31 candidate: invert to a key, self-check against the primary
 // capture, then cross-check against every other capture. Returns true only if
 // the key reproduces ALL captures.
+//
+// Proto-aware:
+//   * Fiat V1 (proto 0): invert with the primary's (uid, button, counter,
+//     epoch=0) and verify every capture with its own (uid, button, counter).
+//   * Fiat V2 (proto 1): for each of the 4 IV combos, invert the primary with
+//     fiat_v2_iv_button/control(primary->raw, combo) and verify EVERY capture
+//     with the SAME combo (each cap re-derives uid/hop/IV from its own raw
+//     frame). Accept if SOME combo validates ALL captures.
+//   * Renault V1 (proto 2): `slice` fixes the hop slice (it selected the
+//     kernel authenticator that produced this state31). For each of the 4 IV
+//     combos, invert the primary with renault_v1_iv_button/control(primary,
+//     combo) at this slice's candidate hop, and verify EVERY capture with
+//     renault_v1_candidate_hop(cap->payload42, slice) + the same combo IV.
+//     Accept if SOME combo validates ALL captures.
+// epoch is 0 for all protocols.
 static bool hitag2_validate_candidate(
     Hitag2Shared* sh,
     uint64_t state31,
+    uint8_t slice,
     uint8_t out_key[6]) {
     const Hitag2Capture* primary = &sh->caps[0];
-    if(!hitag2_fiat_invert_init(
-           state31, primary->uid, primary->button, primary->counter, 0, out_key)) {
+
+    if(primary->proto == HITAG2_PROTO_FIAT_V1) {
+        if(!hitag2_fiat_invert_init(
+               state31, primary->uid, primary->button, primary->counter, 0, out_key)) {
+            return false;
+        }
+        for(uint32_t i = 0; i < sh->capture_count; i++) {
+            const Hitag2Capture* c = &sh->caps[i];
+            if(!subghz_protocol_fiat_v1_verify_key(
+                   c->uid, c->button, c->counter, c->hop, out_key, 0)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if(primary->proto == HITAG2_PROTO_FIAT_V2) {
+        for(uint8_t combo = 0; combo < FIAT_V2_IV_COMBO_COUNT; combo++) {
+            uint8_t pbtn = fiat_v2_iv_button(primary->raw, combo);
+            uint16_t pctl = fiat_v2_iv_control(primary->raw, combo);
+            uint8_t key[6];
+            if(!hitag2_fiat_invert_init(state31, primary->uid, pbtn, pctl, 0, key)) {
+                continue;
+            }
+            bool all_ok = true;
+            for(uint32_t i = 0; i < sh->capture_count; i++) {
+                const Hitag2Capture* c = &sh->caps[i];
+                uint8_t cbtn = fiat_v2_iv_button(c->raw, combo);
+                uint16_t cctl = fiat_v2_iv_control(c->raw, combo);
+                if(!subghz_protocol_fiat_v1_verify_key(
+                       fiat_v2_uid(c->raw), cbtn, cctl, fiat_v2_hop(c->raw), key, 0)) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if(all_ok) {
+                memcpy(out_key, key, 6);
+                return true;
+            }
+        }
         return false;
     }
-    // Self-check (should always hold for a genuine candidate).
-    for(uint32_t i = 0; i < sh->capture_count; i++) {
-        const Hitag2Capture* c = &sh->caps[i];
-        uint32_t exp = hitag2_fiat_full_auth(c->uid, c->button, c->counter, out_key, 0);
-        if(exp != c->hop) return false;
+
+    if(primary->proto == HITAG2_PROTO_RENAULT_V1) {
+        uint32_t phop = renault_v1_candidate_hop(primary->payload42, slice);
+        for(uint8_t combo = 0; combo < RENAULT_V1_IV_COMBO_COUNT; combo++) {
+            uint8_t pbtn = renault_v1_iv_button(primary->button, combo);
+            uint16_t pctl = renault_v1_iv_control((uint8_t)primary->counter, combo);
+            uint8_t key[6];
+            if(!hitag2_fiat_invert_init(state31, primary->uid, pbtn, pctl, 0, key)) {
+                continue;
+            }
+            // Self-check the primary at this (slice, combo).
+            if(!subghz_protocol_fiat_v1_verify_key(
+                   primary->uid, pbtn, pctl, phop, key, 0)) {
+                continue;
+            }
+            bool all_ok = true;
+            for(uint32_t i = 0; i < sh->capture_count; i++) {
+                const Hitag2Capture* c = &sh->caps[i];
+                uint8_t cbtn = renault_v1_iv_button(c->button, combo);
+                uint16_t cctl = renault_v1_iv_control((uint8_t)c->counter, combo);
+                uint32_t chop = renault_v1_candidate_hop(c->payload42, slice);
+                if(!subghz_protocol_fiat_v1_verify_key(
+                       c->uid, cbtn, cctl, chop, key, 0)) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if(all_ok) {
+                memcpy(out_key, key, 6);
+                return true;
+            }
+        }
+        return false;
     }
-    return true;
+
+    return false;
 }
 
 static bool hitag2_worker_progress_cb(uint8_t pct, uint64_t states_tested, void* ctx) {
@@ -127,21 +213,42 @@ static void* hitag2_worker_main(void* arg) {
         cfg.l0_start = base;
         cfg.l0_end = end;
 
-        Hitag2HellResult r;
-        memset(&r, 0, sizeof(r));
+        // The Hell kernel takes ONLY a hop. Renault V1's hop is one of three
+        // candidate slices of the 42-bit payload, so we run the kernel once per
+        // slice; Fiat V1/V2 have exactly one hop (a single slice). The slice
+        // that produced a given state31 is passed down to validation so the
+        // right candidate hop / IV is used.
+        const Hitag2Capture* primary = &sh->caps[0];
+        uint8_t slice_count =
+            (primary->proto == HITAG2_PROTO_RENAULT_V1) ? RENAULT_V1_HOP_SLICE_COUNT : 1U;
 
-        // Primary capture's hop is what the kernel searches for.
-        if(hitag2_hell_recover(sh->caps[0].hop, &cfg, &r)) {
-            for(uint32_t i = 0; i < r.candidate_count; i++) {
-                uint8_t key[6];
-                if(hitag2_validate_candidate(sh, r.candidates[i], key)) {
-                    pthread_mutex_lock(&sh->found_lock);
-                    if(!atomic_load(&sh->found)) {
-                        memcpy(sh->found_key, key, 6);
-                        atomic_store(&sh->found, 1);
+        for(uint8_t slice = 0; slice < slice_count; slice++) {
+            if(atomic_load_explicit(&sh->found, memory_order_relaxed)) break;
+            if(atomic_load_explicit(&sh->abort_all, memory_order_relaxed)) break;
+
+            uint32_t authenticator;
+            if(primary->proto == HITAG2_PROTO_RENAULT_V1) {
+                authenticator = renault_v1_candidate_hop(primary->payload42, slice);
+            } else {
+                // Fiat V1 and Fiat V2 both search the primary's single hop.
+                authenticator = primary->hop;
+            }
+
+            Hitag2HellResult r;
+            memset(&r, 0, sizeof(r));
+
+            if(hitag2_hell_recover(authenticator, &cfg, &r)) {
+                for(uint32_t i = 0; i < r.candidate_count; i++) {
+                    uint8_t key[6];
+                    if(hitag2_validate_candidate(sh, r.candidates[i], slice, key)) {
+                        pthread_mutex_lock(&sh->found_lock);
+                        if(!atomic_load(&sh->found)) {
+                            memcpy(sh->found_key, key, 6);
+                            atomic_store(&sh->found, 1);
+                        }
+                        pthread_mutex_unlock(&sh->found_lock);
+                        break;
                     }
-                    pthread_mutex_unlock(&sh->found_lock);
-                    break;
                 }
             }
         }
