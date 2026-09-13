@@ -110,7 +110,12 @@ class PsaOffloadRecoverer {
       progressAddress: progressCounter.address,
     );
 
-    final runFuture = Isolate.run(() => _runInIsolate(payload));
+    // IMPORTANT: spawn via a static helper so the closure sent to Isolate.run
+    // captures ONLY `payload` (sendable) and nothing from this lexical scope.
+    // `Isolate.run(() => _runInIsolate(payload))` written inline here would also
+    // capture `timer` and `progressController`, which are non-sendable and throw
+    // "object is unsendable - _Timer" at runtime.
+    final runFuture = _spawnRecovery(payload);
     final result = runFuture.whenComplete(() {
       timer.cancel();
       calloc.free(cancel);
@@ -121,6 +126,13 @@ class PsaOffloadRecoverer {
     return PsaOffloadHandle(result, progressController, () {
       cancel.value = 1;
     });
+  }
+
+  /// Spawns the worker isolate. Kept as a separate static method so the closure
+  /// sent to [Isolate.run] captures ONLY [payload] (sendable) and nothing from
+  /// the caller's scope (timer / stream controller).
+  static Future<PsaOffloadResult> _spawnRecovery(_PsaOffloadPayload payload) {
+    return Isolate.run(() => _runInIsolate(payload));
   }
 
   static PsaOffloadResult _runInIsolate(_PsaOffloadPayload p) {

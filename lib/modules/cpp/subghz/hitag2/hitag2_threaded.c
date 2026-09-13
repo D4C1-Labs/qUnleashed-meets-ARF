@@ -60,6 +60,12 @@ typedef struct {
     uint32_t l0_end;
     int is_leader;
     uint64_t last_slots; // for incremental slots accounting
+    // [PHONE STUCK-AT-0% FIX] Base index of the chunk the leader is CURRENTLY
+    // processing, so its in-kernel progress callback can report a live estimate
+    // (chunk_base - l0_base + slots within the chunk) even before the chunk
+    // finishes. Keeps progress moving on single-core devices too, where no other
+    // worker is advancing sh->slots_done in the meantime.
+    uint32_t cur_chunk_base;
 } Hitag2Worker;
 
 // Validate a state31 candidate: invert to a key, self-check against the primary
@@ -166,8 +172,12 @@ static bool hitag2_validate_candidate(
     return false;
 }
 
+// Slots grabbed per atomic fetch. Small enough that big/little cores stay
+// balanced and cancel stays responsive; large enough that the atomic and the
+// per-call kernel setup are amortized over real work.
+#define HITAG2_WORK_CHUNK 64U
+
 static bool hitag2_worker_progress_cb(uint8_t pct, uint64_t states_tested, void* ctx) {
-    (void)pct;
     (void)states_tested;
     Hitag2Worker* w = (Hitag2Worker*)ctx;
     Hitag2Shared* sh = w->sh;
@@ -178,13 +188,36 @@ static bool hitag2_worker_progress_cb(uint8_t pct, uint64_t states_tested, void*
         atomic_store_explicit(&sh->abort_all, 1, memory_order_relaxed);
         return false;
     }
+
+    // [PHONE STUCK-AT-0% FIX] The kernel now calls this frequently (after every
+    // heavy L0 slot). Push a progress update here so `progress_out` keeps moving
+    // WHILE a worker is deep inside a slow chunk, instead of only between chunks
+    // (the old behavior froze the reported "N keys / pct" for tens of seconds at
+    // a time whenever any worker entered a heavy chunk). Only the leader writes,
+    // to keep the shared progress cell single-writer.
+    //
+    // Live estimate = max(cumulative slots completed by all workers, this
+    // leader's own position inside the chunk it is currently grinding). The
+    // second term keeps progress alive even on a single-core device, where no
+    // other worker is bumping sh->slots_done during a heavy chunk.
+    if(w->is_leader && sh->progress) {
+        uint64_t completed = atomic_load_explicit(&sh->slots_done, memory_order_relaxed);
+        uint32_t within = (uint32_t)(((uint32_t)pct * HITAG2_WORK_CHUNK) / 100U);
+        uint64_t leader_pos = 0;
+        if(w->cur_chunk_base >= sh->l0_base) {
+            leader_pos = (uint64_t)(w->cur_chunk_base - sh->l0_base) + within;
+        }
+        uint64_t total = (leader_pos > completed) ? leader_pos : completed;
+        if(total > sh->total_slots) total = sh->total_slots;
+        uint8_t p = sh->total_slots ? (uint8_t)((total * 100U) / sh->total_slots) : 100U;
+        if(p > 100) p = 100;
+        if(!sh->progress(p, total, sh->progress_ctx)) {
+            atomic_store_explicit(&sh->abort_all, 1, memory_order_relaxed);
+            return false;
+        }
+    }
     return true;
 }
-
-// Slots grabbed per atomic fetch. Small enough that big/little cores stay
-// balanced and cancel stays responsive; large enough that the atomic and the
-// per-call kernel setup are amortized over real work.
-#define HITAG2_WORK_CHUNK 64U
 
 static void* hitag2_worker_main(void* arg) {
     Hitag2Worker* w = (Hitag2Worker*)arg;
@@ -205,6 +238,10 @@ static void* hitag2_worker_main(void* arg) {
         if(base >= sh->l0_limit) break;
         uint32_t end = base + HITAG2_WORK_CHUNK;
         if(end > sh->l0_limit) end = sh->l0_limit;
+
+        // Record the chunk base so the leader's in-kernel progress callback can
+        // report a live position while this chunk is still running.
+        w->cur_chunk_base = base;
 
         Hitag2HellConfig cfg;
         memset(&cfg, 0, sizeof(cfg));
@@ -327,6 +364,7 @@ bool hitag2_threaded_recover(
         workers[i].l0_end = l0_end;
         workers[i].is_leader = (i == 0);
         workers[i].last_slots = 0;
+        workers[i].cur_chunk_base = l0_start;
     }
 
     for(int i = 0; i < n; i++) {

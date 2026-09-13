@@ -130,7 +130,10 @@ class KeeloqOffloadRecoverer {
       progressAddress: progressCounter.address,
     );
 
-    final runFuture = Isolate.run(() => _runInIsolate(payload));
+    // IMPORTANT: spawn via a static helper so the closure sent to Isolate.run
+    // captures ONLY `payload` (sendable), not `timer`/`progressController` from
+    // this scope (which are non-sendable and throw "object is unsendable").
+    final runFuture = _spawnRecovery(payload);
     final result = runFuture.whenComplete(() {
       timer.cancel();
       calloc.free(cancel);
@@ -141,6 +144,12 @@ class KeeloqOffloadRecoverer {
     return KeeloqOffloadHandle(result, progressController, () {
       cancel.value = 1;
     });
+  }
+
+  /// Spawns the worker isolate. Separate static method so the closure sent to
+  /// [Isolate.run] captures ONLY [payload] and nothing from the caller's scope.
+  static Future<KeeloqOffloadResult> _spawnRecovery(_KlPayload payload) {
+    return Isolate.run(() => _runInIsolate(payload));
   }
 
   static KeeloqOffloadResult _runInIsolate(_KlPayload p) {

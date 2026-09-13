@@ -387,8 +387,17 @@ bool hitag2_hell_recover(
         }
     }
     const uint32_t l0_total = l0_end - l0_start;
-    const uint32_t progress_step = 1024U;
-    uint32_t next_progress = l0_start + progress_step;
+    // [PROGRESS/STALL FIX] Checkpoint by loop ITERATIONS since this call began,
+    // not against an absolute i0 boundary. The old `i0 >= l0_start + 1024` test
+    // was never reached when the caller ran short sub-ranges (the threaded
+    // driver hands out 64-slot work chunks), so progress_cb / cancel / timeout
+    // were never evaluated inside a chunk. That both stalled the reported
+    // progress (only the between-chunk leader push moved, which freezes for tens
+    // of seconds on a heavy chunk) and delayed cancellation. We now checkpoint
+    // after every heavy (deep-searched) slot and at least every `progress_step`
+    // cheap slots.
+    const uint32_t progress_step = 16U;
+    uint32_t since_checkpoint = 0;
     uint32_t t_start = 0;
     if(config && config->timeout_ms > 0 && config->now_ms_cb) {
         t_start = config->now_ms_cb();
@@ -402,48 +411,55 @@ bool hitag2_hell_recover(
     };
 
     for(uint32_t i0 = l0_start; i0 < l0_end; i0++) {
+        bool did_deep_search = false;
         uint64_t s0 = expand_layer0(i0);
         // Layer 0 check: filter@round 0.
         if(layer0_filter(s0) != ((authenticator >> 31) & 1U)) {
             ctx.states_tested++;
-            continue;
-        }
-
-        // Set up state[] bitslices: L0 bits scalar (broadcast to all lanes),
-        // L1 spread bits use k_spread_patterns, everything else zero.
-        bitslice_t state[STATE_ARR_LEN];
-        memset(state, 0, sizeof(state));
-        for(uint8_t k = 0; k < 20U; k++) {
-            state[k_layer0_bits[k]] = bs_from_bit((uint8_t)((s0 >> k_layer0_bits[k]) & 1U));
-        }
-        // L1 spread bits: 5 patterns
-        for(uint8_t k = 0; k < 5U; k++) {
-            uint8_t bit_pos = k_layer1_bits[k_layer1_spread_sel[k]];
-            state[bit_pos] = k_spread_patterns[k];
-        }
-
-        // Iterate the 9 scalar L1 bits: 512 combinations.
-        for(uint32_t i1 = 0; i1 < (1U << 9); i1++) {
-            for(uint8_t k = 0; k < 9U; k++) {
-                uint8_t bit_pos = k_layer1_bits[k_layer1_scalar_sel[k]];
-                state[bit_pos] = bs_from_bit((uint8_t)((i1 >> k) & 1U));
+        } else {
+            // Set up state[] bitslices: L0 bits scalar (broadcast to all lanes),
+            // L1 spread bits use k_spread_patterns, everything else zero.
+            bitslice_t state[STATE_ARR_LEN];
+            memset(state, 0, sizeof(state));
+            for(uint8_t k = 0; k < 20U; k++) {
+                state[k_layer0_bits[k]] =
+                    bs_from_bit((uint8_t)((s0 >> k_layer0_bits[k]) & 1U));
+            }
+            // L1 spread bits: 5 patterns
+            for(uint8_t k = 0; k < 5U; k++) {
+                uint8_t bit_pos = k_layer1_bits[k_layer1_spread_sel[k]];
+                state[bit_pos] = k_spread_patterns[k];
             }
 
-            // Round-1 filter check.
-            bitslice_t f1 = bs_filter_at_r1(state);
-            bitslice_t alive = ~(f1 ^ keystream[1]);
-            if(alive == 0) continue;
+            // Iterate the 9 scalar L1 bits: 512 combinations.
+            for(uint32_t i1 = 0; i1 < (1U << 9); i1++) {
+                for(uint8_t k = 0; k < 9U; k++) {
+                    uint8_t bit_pos = k_layer1_bits[k_layer1_scalar_sel[k]];
+                    state[bit_pos] = bs_from_bit((uint8_t)((i1 >> k) & 1U));
+                }
 
-            // Descend into layers 2..31.
-            deep_search(&ctx, state, alive);
-            if(result->overflow) break;
+                // Round-1 filter check.
+                bitslice_t f1 = bs_filter_at_r1(state);
+                bitslice_t alive = ~(f1 ^ keystream[1]);
+                if(alive == 0) continue;
+
+                // Descend into layers 2..31.
+                deep_search(&ctx, state, alive);
+                if(result->overflow) break;
+            }
+
+            ctx.states_tested += (1U << 9);
+            did_deep_search = true;
         }
 
-        ctx.states_tested += (1U << 9);
-
-        if(i0 >= next_progress) {
-            next_progress += progress_step;
-            uint8_t pct = (uint8_t)(l0_total ? ((uint64_t)(i0 - l0_start) * 100U / l0_total) : 100U);
+        // [PROGRESS/STALL FIX] Checkpoint after every heavy (deep-searched) slot
+        // and at least every `progress_step` cheap slots, so progress_cb /
+        // cancel / timeout are evaluated frequently regardless of chunk length.
+        since_checkpoint++;
+        if(did_deep_search || since_checkpoint >= progress_step) {
+            since_checkpoint = 0;
+            uint8_t pct =
+                (uint8_t)(l0_total ? ((uint64_t)(i0 - l0_start) * 100U / l0_total) : 100U);
             if(config && config->progress_cb) {
                 if(!config->progress_cb(pct, ctx.states_tested, config->progress_ctx)) {
                     result->cancelled = true;
